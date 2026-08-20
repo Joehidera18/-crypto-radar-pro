@@ -1,0 +1,2480 @@
+from flask import Flask, jsonify, render_template_string, request
+import requests
+import math
+import time
+import os
+import re
+import html
+import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote_plus
+from xml.etree import ElementTree as ET
+
+app = Flask(__name__)
+
+# ============================================================
+# CRYPTO RADAR PRO v10 — DAY-TRADING RADAR + FOCUS MODE
+# ============================================================
+#
+# Goals:
+# - Broad crypto discovery
+# - Staged analysis so free hosting does not die from API calls
+# - Better separation of:
+#     opportunity / risk / data quality / catalyst strength
+# - Avoid pretending a score is a true probability
+# - Avoid small-cap = automatically bullish
+# - Avoid stablecoins / wrapped duplicates dominating rankings
+# - Use liquidity, volatility, momentum, market regime, news,
+#   technical structure, and catalyst language together
+#
+# Research only. No order execution.
+# ============================================================
+
+# ---------------------- PROVIDERS ----------------------
+
+COINGECKO = "https://api.coingecko.com/api/v3"
+COINPAPRIKA = "https://api.coinpaprika.com/v1"
+BINANCE_US = "https://api.binance.us"
+ALTERNATIVE_FNG = "https://api.alternative.me/fng/"
+FINNHUB = "https://finnhub.io/api/v1"
+
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+def env_int(name, default, lo=None, hi=None):
+    """Read integer env vars without allowing a bad Render value to crash startup."""
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except Exception:
+        value = int(default)
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+CACHE_SECONDS = env_int("CACHE_SECONDS", 75, 15, 900)
+MAX_CRYPTO_UNIVERSE = env_int("MAX_CRYPTO_UNIVERSE", 1000, 100, 2000)
+PRELIM_LIMIT = env_int("PRELIM_LIMIT", 80, 20, 200)
+TECH_LIMIT = env_int("TECH_LIMIT", 36, 10, 80)
+NEWS_LIMIT = env_int("NEWS_LIMIT", 24, 5, 60)
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "CryptoRadarPro/4.0 research-only",
+    "Accept": "application/json,text/plain,*/*"
+})
+
+cache = {}
+cache_lock = threading.Lock()
+
+news_cache = {}
+news_cache_lock = threading.Lock()
+NEWS_CACHE_SECONDS = env_int("NEWS_CACHE_SECONDS", 420, 60, 3600)
+scan_compute_lock = threading.Lock()
+
+# ---------------------- CONFIG ----------------------
+
+HORIZONS = {
+    "1h":{"label":"Next 1 Hour · Scalping","momentum":1.85,"technical":1.80,"liquidity":1.45,"news":0.55,"catalyst":0.35,"fundamental":0.10,"regime":1.15},
+    "4h":{"label":"Next 4 Hours · Day Trade","momentum":1.75,"technical":1.70,"liquidity":1.30,"news":0.75,"catalyst":0.50,"fundamental":0.15,"regime":1.10},
+    "12h":{"label":"Next 12 Hours","momentum":1.60,"technical":1.55,"liquidity":1.15,"news":1.00,"catalyst":0.65,"fundamental":0.20,"regime":1.05},
+    "24h":{"label":"Next 24 Hours","momentum":1.45,"technical":1.35,"liquidity":1.00,"news":1.20,"catalyst":0.85,"fundamental":0.30,"regime":1.00},
+    "3d":{"label":"Next 3 Days","momentum":1.35,"technical":1.25,"liquidity":0.95,"news":1.30,"catalyst":1.05,"fundamental":0.40,"regime":0.95},
+    "1w":{"label":"Next Week","momentum":1.15,"technical":1.10,"liquidity":0.90,"news":1.15,"catalyst":1.25,"fundamental":0.55,"regime":0.85},
+    "1m":{"label":"Next Month","momentum":0.90,"technical":0.85,"liquidity":0.80,"news":1.00,"catalyst":1.45,"fundamental":0.80,"regime":0.70},
+    "3m":{"label":"Next 3 Months","momentum":0.65,"technical":0.65,"liquidity":0.70,"news":0.75,"catalyst":1.30,"fundamental":1.20,"regime":0.55},
+    "1y":{"label":"1 Year+","momentum":0.30,"technical":0.40,"liquidity":0.55,"news":0.45,"catalyst":0.80,"fundamental":1.65,"regime":0.45},
+}
+
+RISK_MODES = {
+    "conservative": {
+        "label": "Conservative",
+        "min_mcap": 2_000_000_000,
+        "min_volume": 25_000_000,
+        "min_liq_ratio": 0.004,
+        "smallcap_bonus": 0,
+        "volatility_preference": 0.20,
+        "quality_weight": 1.35,
+        "risk_penalty": 1.40,
+    },
+    "moderate": {
+        "label": "Moderate",
+        "min_mcap": 250_000_000,
+        "min_volume": 8_000_000,
+        "min_liq_ratio": 0.006,
+        "smallcap_bonus": 0.10,
+        "volatility_preference": 0.35,
+        "quality_weight": 1.10,
+        "risk_penalty": 1.00,
+    },
+    "aggressive": {
+        "label": "Aggressive",
+        "min_mcap": 30_000_000,
+        "min_volume": 2_000_000,
+        "min_liq_ratio": 0.008,
+        "smallcap_bonus": 0.35,
+        "volatility_preference": 0.70,
+        "quality_weight": 0.85,
+        "risk_penalty": 0.70,
+    },
+    "extreme": {
+        "label": "Extreme / Moonshot",
+        "min_mcap": 2_000_000,
+        "min_volume": 250_000,
+        "min_liq_ratio": 0.010,
+        "smallcap_bonus": 0.70,
+        "volatility_preference": 1.00,
+        "quality_weight": 0.60,
+        "risk_penalty": 0.45,
+    },
+}
+
+STABLE_SYMBOLS = {
+    "USDT","USDC","DAI","FDUSD","TUSD","USDP","USDS","PYUSD","GUSD","FRAX",
+    "LUSD","EURC","USDE","SUSD","USD0","USDD","EURS"
+}
+
+WRAPPED_HINTS = (
+    "wrapped ", "staked ", "bridged ", "wormhole", "binance-peg",
+    "lido staked", "wrapped bitcoin", "wrapped ether"
+)
+
+POSITIVE_WORDS = {
+    "approval","approved","partnership","partners","integration","integrates",
+    "launch","launches","released","release","upgrade","upgrades","adoption",
+    "adopts","contract","award","wins","growth","surge","breakthrough",
+    "successful","success","phase 3","phase iii","fda","etf","listing",
+    "listed","mainnet","testnet","burn","buyback","acquisition","acquires",
+    "merger","collaboration","roadmap","milestone","expansion","expands",
+    "institutional","funding","investment","grant","government contract"
+}
+
+NEGATIVE_WORDS = {
+    "hack","hacked","exploit","breach","lawsuit","investigation","probe",
+    "fraud","scam","outage","delay","delayed","delist","delisting",
+    "bankruptcy","default","rejected","rejection","ban","banned","charges",
+    "liquidation","selloff","plunge","crash","downgrade","dilution",
+    "offering","unlock","token unlock","rug","shutdown","halt"
+}
+
+FUTURE_CATALYST_WORDS = {
+    "upcoming","soon","next","will","plans","planned","scheduled","expected",
+    "expects","launch","release","upgrade","roadmap","conference","vote",
+    "decision","trial","earnings","mainnet","listing","burn","airdrop",
+    "deadline","approval","migration","hard fork","testnet","partnership"
+}
+
+# ---------------------- HELPERS ----------------------
+
+def sf(x, default=0.0):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+def clamp(x, lo=0.0, hi=100.0):
+    return max(lo, min(hi, x))
+
+def safe_div(a, b, default=0.0):
+    return a / b if b else default
+
+def pct(a, b):
+    return (a / b - 1.0) * 100.0 if b else 0.0
+
+def mean(vals, default=0.0):
+    vals = [sf(v) for v in vals if v is not None]
+    return statistics.mean(vals) if vals else default
+
+def req_json(url, params=None, timeout=18, retries=3, extra_headers=None):
+    headers = dict(session.headers)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, params=params, timeout=timeout, headers=headers)
+            if r.status_code == 429:
+                last_err = RuntimeError(f"HTTP 429 rate limit from {url}")
+                time.sleep(1.25 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.8 * (attempt + 1))
+    raise last_err
+
+def log_scale(value, floor=1):
+    return math.log10(max(sf(value), floor))
+
+def robust_rank_score(values):
+    """Return percentile-style 0..100 scores, robust to outliers."""
+    if not values:
+        return []
+    indexed = sorted((sf(v), i) for i, v in enumerate(values))
+    out = [50.0] * len(values)
+    n = max(len(indexed) - 1, 1)
+    for rank, (_, idx) in enumerate(indexed):
+        out[idx] = 100.0 * rank / n
+    return out
+
+def parse_rss(url, limit=15):
+    try:
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = item.findtext("title") or ""
+            link = item.findtext("link") or ""
+            pub = item.findtext("pubDate") or ""
+            title = html.unescape(re.sub(r"<[^>]+>", " ", title)).strip()
+            if title:
+                items.append({"title": title, "link": link, "published": pub})
+        return items
+    except Exception:
+        return []
+
+def google_news(query, days, limit=10):
+    q = quote_plus(f'{query} when:{days}d')
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    return parse_rss(url, limit)
+
+
+coinbase_cache={"ts":0.0,"symbols":{},"ok":False}
+coinbase_lock=threading.Lock()
+source_feed_cache={"ts":0.0,"items":[]}
+source_feed_lock=threading.Lock()
+
+def parse_any_feed(url,limit=20):
+    try:
+        r=session.get(url,timeout=9);r.raise_for_status();root=ET.fromstring(r.content);out=[]
+        for node in root.iter():
+            if node.tag.split("}")[-1].lower() not in ("item","entry"): continue
+            title="";link="";published=""
+            for child in list(node):
+                t=child.tag.split("}")[-1].lower()
+                if t=="title" and child.text:title=child.text
+                elif t=="link":link=child.attrib.get("href") or (child.text or "")
+                elif t in ("pubdate","published","updated") and child.text:published=child.text
+            title=html.unescape(re.sub(r"<[^>]+>"," ",title or "")).strip()
+            if title: out.append({"title":title,"link":link,"published":published})
+            if len(out)>=limit:break
+        return out
+    except Exception:return []
+
+def get_coinbase_markets():
+    now=time.time()
+    with coinbase_lock:
+        if now-coinbase_cache["ts"]<600 and coinbase_cache["symbols"]:return coinbase_cache["symbols"],coinbase_cache["ok"]
+    symbols={};ok=False
+    try:
+        r=session.get("https://api.exchange.coinbase.com/products",timeout=10);r.raise_for_status();data=r.json()
+        if isinstance(data,list):
+            for p in data:
+                b=str(p.get("base_currency") or "").upper();q=str(p.get("quote_currency") or "").upper();status=str(p.get("status") or "online").lower()
+                if b and q in ("USD","USDC","USDT") and status=="online" and not bool(p.get("trading_disabled",False)):
+                    symbols.setdefault(b,[]).append(str(p.get("id") or f"{b}-{q}"))
+            ok=True
+    except Exception:pass
+    with coinbase_lock:coinbase_cache.update({"ts":now,"symbols":symbols,"ok":ok})
+    return symbols,ok
+
+def crypto_industry_feed():
+    now=time.time()
+    with source_feed_lock:
+        if now-source_feed_cache["ts"]<300 and source_feed_cache["items"]:return list(source_feed_cache["items"])
+    items=[]
+    for source,url in [("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),("Cointelegraph","https://cointelegraph.com/rss"),("Decrypt","https://decrypt.co/feed")]:
+        for x in parse_any_feed(url,20):x=dict(x);x["source"]=source;items.append(x)
+    with source_feed_lock:source_feed_cache.update({"ts":now,"items":items})
+    return items
+
+def relevant_industry_news(asset,limit=6):
+    name=str(asset.get("name") or "").lower();symbol=str(asset.get("symbol") or "").lower();out=[]
+    for x in crypto_industry_feed():
+        t=x["title"].lower();hit=(name and name in t) or (len(symbol)>=3 and re.search(rf"(?<![a-z0-9]){re.escape(symbol)}(?![a-z0-9])",t))
+        if hit:out.append(x)
+        if len(out)>=limit:break
+    return out
+
+def reddit_context(asset,limit=7):
+    name=str(asset.get("name") or "");symbol=str(asset.get("symbol") or "").upper();q=quote_plus(f'"{name}" {symbol} crypto')
+    posts=parse_any_feed(f"https://www.reddit.com/search.rss?q={q}&sort=new&t=day",limit);pos=neg=0
+    for p in posts:
+        ss,_=headline_signal(p["title"])
+        if ss>0:pos+=ss
+        elif ss<0:neg+=abs(ss)
+    if not posts:return {"available":False,"score":50.0,"mentions":0,"sentiment":"unavailable","posts":[]}
+    score=clamp(50+pos*4-neg*5+min(len(posts),8)*1.2);sentiment="bullish" if score>=58 else ("bearish" if score<=42 else "mixed")
+    return {"available":True,"score":round(score,1),"mentions":len(posts),"sentiment":sentiment,"posts":posts[:5]}
+
+
+def headline_signal(title):
+    t = title.lower()
+    pos = sum(1 for w in POSITIVE_WORDS if w in t)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in t)
+    future = sum(1 for w in FUTURE_CATALYST_WORDS if w in t)
+    return pos - neg, future
+
+# ---------------------- BROAD MARKET DATA ----------------------
+
+def get_coingecko_universe():
+    rows = []
+    cg_headers = {}
+    if COINGECKO_API_KEY:
+        cg_headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
+    pages = max(1, math.ceil(MAX_CRYPTO_UNIVERSE / 250))
+    for page in range(1, pages + 1):
+        j = req_json(
+            f"{COINGECKO}/coins/markets",
+            {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 250,
+                "page": page,
+                "sparkline": "false",
+                "price_change_percentage": "1h,24h,7d,30d",
+            },
+            extra_headers=cg_headers,
+            retries=3,
+        )
+        if not isinstance(j, list):
+            raise RuntimeError("CoinGecko returned unexpected data")
+        rows.extend(j)
+        if len(rows) >= MAX_CRYPTO_UNIVERSE:
+            break
+    return rows[:MAX_CRYPTO_UNIVERSE]
+
+def get_coinpaprika_universe():
+    j = req_json(f"{COINPAPRIKA}/tickers", timeout=25, retries=3)
+    if not isinstance(j, list):
+        raise RuntimeError("CoinPaprika returned unexpected data")
+
+    rows = []
+    for x in j:
+        q = (x.get("quotes") or {}).get("USD") or {}
+        rows.append({
+            "id": x.get("id"),
+            "symbol": x.get("symbol", ""),
+            "name": x.get("name", ""),
+            "current_price": sf(q.get("price")),
+            "market_cap": sf(q.get("market_cap")),
+            "total_volume": sf(q.get("volume_24h")),
+            "price_change_percentage_1h_in_currency": sf(q.get("percent_change_1h")),
+            "price_change_percentage_24h_in_currency": sf(q.get("percent_change_24h")),
+            "price_change_percentage_7d_in_currency": sf(q.get("percent_change_7d")),
+            "price_change_percentage_30d_in_currency": sf(q.get("percent_change_30d")),
+        })
+    rows.sort(key=lambda z: sf(z.get("market_cap")), reverse=True)
+    return rows[:MAX_CRYPTO_UNIVERSE]
+
+def get_crypto_universe():
+    try:
+        rows = get_coingecko_universe()
+        if rows:
+            return rows, "CoinGecko", None
+    except Exception as e:
+        cg_err = str(e)
+    else:
+        cg_err = "no rows"
+
+    try:
+        rows = get_coinpaprika_universe()
+        if rows:
+            return rows, "CoinPaprika", f"CoinGecko unavailable: {cg_err}"
+    except Exception as e:
+        return [], "Unavailable", f"CoinGecko failed ({cg_err}); CoinPaprika failed ({e})"
+
+    return [], "Unavailable", f"CoinGecko failed ({cg_err}); fallback returned no rows"
+
+# ---------------------- MARKET REGIME ----------------------
+
+def fear_greed():
+    try:
+        d = req_json(ALTERNATIVE_FNG, timeout=10, retries=2)["data"][0]
+        return int(d["value"]), d["value_classification"]
+    except Exception:
+        return 50, "Unavailable"
+
+def market_regime(rows):
+    if not rows:
+        return {"score":50,"label":"UNKNOWN","breadth":50}
+
+    top = [x for x in rows[:100] if sf(x.get("market_cap")) > 0]
+    if not top:
+        return {"score":50,"label":"UNKNOWN","breadth":50}
+
+    positive_24 = sum(1 for x in top if sf(x.get("price_change_percentage_24h_in_currency")) > 0)
+    positive_7 = sum(1 for x in top if sf(x.get("price_change_percentage_7d_in_currency")) > 0)
+    breadth = (positive_24 / len(top) * 50) + (positive_7 / len(top) * 50)
+
+    btc = next((x for x in rows if str(x.get("symbol","")).lower() == "btc"), None)
+    btc24 = sf(btc.get("price_change_percentage_24h_in_currency")) if btc else 0
+    btc7 = sf(btc.get("price_change_percentage_7d_in_currency")) if btc else 0
+
+    score = clamp(50 + (breadth - 50) * 0.65 + btc24 * 1.4 + btc7 * 0.45)
+    if score >= 63:
+        label = "RISK-ON"
+    elif score <= 37:
+        label = "RISK-OFF"
+    else:
+        label = "MIXED"
+
+    return {"score":round(score,1),"label":label,"breadth":round(breadth,1)}
+
+# ---------------------- FILTERS / PRELIMINARY SCORE ----------------------
+
+def is_bad_duplicate_or_stable(name, symbol):
+    n = (name or "").lower().strip()
+    s = (symbol or "").upper().strip()
+
+    if s in STABLE_SYMBOLS:
+        return True
+
+    if any(h in n for h in WRAPPED_HINTS):
+        return True
+
+    # Skip obvious LP tokens / receipt tokens / stable naming.
+    if any(k in n for k in ("liquidity pool", "lp token", "usd stablecoin", "stablecoin")):
+        return True
+
+    return False
+
+def horizon_momentum(asset, horizon):
+    ch1 = asset["change_1h"]
+    ch24 = asset["change_24h"]
+    ch7 = asset["change_7d"]
+    ch30 = asset["change_30d"]
+
+    if horizon == "24h":
+        return ch1 * 0.45 + ch24 * 0.55
+    if horizon == "3d":
+        return ch24 * 0.60 + ch7 * 0.40
+    if horizon == "1w":
+        return ch24 * 0.20 + ch7 * 0.80
+    if horizon == "1m":
+        return ch7 * 0.35 + ch30 * 0.65
+    if horizon == "3m":
+        return ch30 * 0.85 + ch7 * 0.15
+    return ch30 * 0.35 + ch7 * 0.15
+
+def preprocess_crypto(rows, horizon, risk):
+    cfg = RISK_MODES[risk]
+    clean = []
+
+    for x in rows:
+        symbol = str(x.get("symbol","")).upper()
+        name = str(x.get("name",""))
+
+        if is_bad_duplicate_or_stable(name, symbol):
+            continue
+
+        mcap = sf(x.get("market_cap"))
+        vol = sf(x.get("total_volume"))
+        price = sf(x.get("current_price"))
+
+        if price <= 0 or mcap <= 0 or vol <= 0:
+            continue
+        if mcap < cfg["min_mcap"]:
+            continue
+        if vol < cfg["min_volume"]:
+            continue
+
+        liq_ratio = vol / mcap
+        if liq_ratio < cfg["min_liq_ratio"]:
+            continue
+
+        clean.append({
+            "asset_type":"crypto",
+            "id":x.get("id"),
+            "symbol":symbol,
+            "name":name,
+            "price":price,
+            "market_cap":mcap,
+            "volume":vol,
+            "liq_ratio":liq_ratio,
+            "change_1h":sf(x.get("price_change_percentage_1h_in_currency")),
+            "change_24h":sf(x.get("price_change_percentage_24h_in_currency")),
+            "change_7d":sf(x.get("price_change_percentage_7d_in_currency")),
+            "change_30d":sf(x.get("price_change_percentage_30d_in_currency")),
+        })
+
+    if not clean:
+        return []
+
+    mcap_scores = robust_rank_score([log_scale(a["market_cap"]) for a in clean])
+    volume_scores = robust_rank_score([log_scale(a["volume"]) for a in clean])
+    liq_scores = robust_rank_score([a["liq_ratio"] for a in clean])
+
+    for i, a in enumerate(clean):
+        momentum_raw = horizon_momentum(a, horizon)
+        momentum_score = clamp(50 + momentum_raw * 1.75)
+
+        # Healthy liquidity is good. Extreme turnover can be pump-like.
+        turnover = a["liq_ratio"]
+        liquidity_score = liq_scores[i]
+        if turnover > 2.0:
+            liquidity_score -= 12
+        elif turnover > 1.0:
+            liquidity_score -= 6
+        liquidity_score = clamp(liquidity_score)
+
+        # "Fundamental" proxy for crypto. Not true fundamentals:
+        # persistence/size/liquidity quality without blindly rewarding only mega-caps.
+        quality = (
+            mcap_scores[i] * 0.45 +
+            volume_scores[i] * 0.30 +
+            liquidity_score * 0.25
+        )
+
+        # Risk score: high = dangerous.
+        recent_volatility = (
+            abs(a["change_1h"]) * 2.0 +
+            abs(a["change_24h"]) * 0.75 +
+            abs(a["change_7d"]) * 0.22
+        )
+        concentration_risk = max(0, 60 - mcap_scores[i]) * 0.35
+        risk_score = clamp(
+            20 +
+            recent_volatility * 1.25 +
+            concentration_risk +
+            max(0, 35 - liquidity_score) * 0.8
+        )
+
+        # Small cap upside is only a modest bonus. It never overrides weak liquidity.
+        smallcap_upside = (100 - mcap_scores[i]) * cfg["smallcap_bonus"]
+        volatility_fit = min(recent_volatility, 35) * cfg["volatility_preference"]
+
+        prelim = (
+            momentum_score * 0.42 +
+            liquidity_score * 0.23 +
+            quality * 0.23 +
+            clamp(50 + smallcap_upside * 0.35 + volatility_fit, 0, 100) * 0.12
+            - risk_score * 0.08 * cfg["risk_penalty"]
+        )
+
+        a.update({
+            "momentum_score":round(momentum_score,1),
+            "liquidity_score":round(liquidity_score,1),
+            "fundamental_score":round(quality,1),
+            "risk_score":round(risk_score,1),
+            "pre_score":round(clamp(prelim),1),
+            "mcap_percentile":round(mcap_scores[i],1),
+            "volume_percentile":round(volume_scores[i],1),
+        })
+
+    clean.sort(key=lambda z:z["pre_score"], reverse=True)
+    return clean
+
+
+# ---------------------- ADVANCED MULTI-TIMEFRAME PRICE ACTION ----------------------
+
+def true_range_series(highs, lows, closes):
+    out=[]
+    for i in range(len(closes)):
+        if i == 0:
+            out.append(highs[i]-lows[i])
+        else:
+            out.append(max(
+                highs[i]-lows[i],
+                abs(highs[i]-closes[i-1]),
+                abs(lows[i]-closes[i-1])
+            ))
+    return out
+
+def atr_value(highs,lows,closes,period=14):
+    tr=true_range_series(highs,lows,closes)
+    return mean(tr[-period:]) if tr else 0
+
+def rolling_vwap(highs,lows,closes,quote_volumes,period=30):
+    if not closes:
+        return 0
+    start=max(0,len(closes)-period)
+    num=0.0
+    den=0.0
+    for i in range(start,len(closes)):
+        typical=(highs[i]+lows[i]+closes[i])/3
+        qv=quote_volumes[i]
+        num += typical*qv
+        den += qv
+    return safe_div(num,den,closes[-1])
+
+def swing_points(highs,lows,left=3,right=3):
+    swing_highs=[]
+    swing_lows=[]
+    n=len(highs)
+    for i in range(left,n-right):
+        h=highs[i]
+        l=lows[i]
+        if all(h>highs[j] for j in range(i-left,i)) and all(h>=highs[j] for j in range(i+1,i+right+1)):
+            swing_highs.append((i,h))
+        if all(l<lows[j] for j in range(i-left,i)) and all(l<=lows[j] for j in range(i+1,i+right+1)):
+            swing_lows.append((i,l))
+    return swing_highs,swing_lows
+
+def market_structure_score(highs,lows,closes):
+    sh,sl=swing_points(highs,lows,3,3)
+    score=50
+    label="mixed"
+    if len(sh)>=2 and len(sl)>=2:
+        hh=sh[-1][1]>sh[-2][1]
+        hl=sl[-1][1]>sl[-2][1]
+        lh=sh[-1][1]<sh[-2][1]
+        ll=sl[-1][1]<sl[-2][1]
+        if hh and hl:
+            score=84; label="higher highs / higher lows"
+        elif lh and ll:
+            score=18; label="lower highs / lower lows"
+        elif hh or hl:
+            score=64; label="improving structure"
+        elif lh or ll:
+            score=36; label="weakening structure"
+    return score,label,sh,sl
+
+def support_resistance_zones(highs,lows,closes,atr):
+    sh,sl=swing_points(highs,lows,3,3)
+    width=max(atr*0.45,closes[-1]*0.0015)
+    points=[("R",p) for _,p in sh[-16:]]+[("S",p) for _,p in sl[-16:]]
+    zones=[]
+    for kind,p in sorted(points,key=lambda z:z[1]):
+        match=None
+        for z in zones:
+            if abs(z["center"]-p)<=width:
+                match=z; break
+        if match:
+            match["prices"].append(p)
+            match["touches"]+=1
+            match["center"]=mean(match["prices"])
+            match["types"].add(kind)
+        else:
+            zones.append({"center":p,"prices":[p],"touches":1,"types":{kind}})
+    for z in zones:
+        z["low"]=z["center"]-width
+        z["high"]=z["center"]+width
+        z["type"]="support" if "S" in z["types"] and "R" not in z["types"] else "resistance" if "R" in z["types"] and "S" not in z["types"] else "pivot"
+    zones.sort(key=lambda z:(z["touches"],-abs(z["center"]-closes[-1])),reverse=True)
+    return zones[:10]
+
+def nearest_zones(price,zones):
+    below=[z for z in zones if z["center"]<price]
+    above=[z for z in zones if z["center"]>price]
+    support=max(below,key=lambda z:z["center"]) if below else None
+    resistance=min(above,key=lambda z:z["center"]) if above else None
+    return support,resistance
+
+def candle_rejection_score(opens,highs,lows,closes,atr):
+    if len(closes)<3 or atr<=0:
+        return 50,"none"
+    score=0
+    label="none"
+    for i in range(-3,0):
+        body=abs(closes[i]-opens[i])
+        upper=highs[i]-max(opens[i],closes[i])
+        lower=min(opens[i],closes[i])-lows[i]
+        base=max(body,atr*0.08)
+        if lower>base*2.2 and lower>upper*1.5:
+            score+=18; label="bullish lower-wick rejection"
+        if upper>base*2.2 and upper>lower*1.5:
+            score-=18; label="bearish upper-wick rejection"
+    return clamp(50+score),label
+
+def liquidity_sweep_signal(highs,lows,closes,atr):
+    if len(closes)<30 or atr<=0:
+        return 50,"none"
+    prior_high=max(highs[-25:-2])
+    prior_low=min(lows[-25:-2])
+    h,l,c=highs[-1],lows[-1],closes[-1]
+    if h>prior_high+atr*0.05 and c<prior_high:
+        return 34,"bearish liquidity sweep above recent highs"
+    if l<prior_low-atr*0.05 and c>prior_low:
+        return 74,"bullish liquidity sweep below recent lows"
+    return 50,"none"
+
+def breakout_retest_signal(highs,lows,closes,volumes,atr):
+    if len(closes)<35 or atr<=0:
+        return 50,"none"
+    prior_high=max(highs[-35:-5])
+    prior_low=min(lows[-35:-5])
+    p=closes[-1]
+    recent_vol=mean(volumes[-3:])
+    base_vol=mean(volumes[-30:-5],1)
+    vr=safe_div(recent_vol,base_vol,1)
+    if p>prior_high and lows[-1]<=prior_high+atr*0.35:
+        return clamp(70+(vr-1)*8,50,92),"bullish breakout / retest"
+    if p<prior_low and highs[-1]>=prior_low-atr*0.35:
+        return clamp(30-(vr-1)*6,8,50),"bearish breakdown / retest"
+    if p>prior_high+atr*0.7:
+        return 61,"breakout extended above resistance"
+    return 50,"none"
+
+def compression_score(highs,lows,closes):
+    if len(closes)<45:
+        return 50
+    recent=max(highs[-12:])-min(lows[-12:])
+    older=max(highs[-40:-12])-min(lows[-40:-12])
+    ratio=safe_div(recent,older,1)
+    if ratio<0.35:return 84
+    if ratio<0.55:return 70
+    if ratio>1.30:return 36
+    return 50
+
+def location_quality(price,support,resistance):
+    score=55
+    label="neutral location"
+    if support:
+        ds=(price-support["center"])/price*100
+        if 0<=ds<=1.5:
+            score+=14; label="near support"
+        elif ds>8:
+            score-=6
+    if resistance:
+        dr=(resistance["center"]-price)/price*100
+        if 0<=dr<=1.0:
+            score-=16; label="directly below resistance"
+        elif 2<=dr<=8:
+            score+=7
+    return clamp(score),label
+
+def aggregate_10m(raw5m):
+    """Binance has no native 10m candles, so combine pairs of 5m candles."""
+    out=[]
+    for i in range(0,len(raw5m)-1,2):
+        a,b=raw5m[i],raw5m[i+1]
+        out.append([
+            a[0],
+            a[1],
+            max(sf(a[2]),sf(b[2])),
+            min(sf(a[3]),sf(b[3])),
+            b[4],
+            sf(a[5])+sf(b[5]),
+            b[6],
+            sf(a[7])+sf(b[7]),
+            int(sf(a[8]))+int(sf(b[8])),
+            sf(a[9])+sf(b[9]),
+            sf(a[10])+sf(b[10]),
+            "0"
+        ])
+    return out
+
+def analyze_timeframe(raw):
+    opens=[sf(r[1]) for r in raw]
+    highs=[sf(r[2]) for r in raw]
+    lows=[sf(r[3]) for r in raw]
+    closes=[sf(r[4]) for r in raw]
+    base_vol=[sf(r[5]) for r in raw]
+    quote_vol=[sf(r[7]) for r in raw]
+    if len(closes)<45:
+        raise RuntimeError("insufficient candles")
+
+    p=closes[-1]
+    atr=atr_value(highs,lows,closes,14)
+    atr_pct=safe_div(atr,p,0)*100
+    e20=ema(closes,20)[-1]
+    e50=ema(closes,50)[-1]
+    e200=ema(closes,200)[-1] if len(closes)>=200 else None
+    rr=rsi(closes,14)
+    vw=rolling_vwap(highs,lows,closes,quote_vol,30)
+
+    structure_score,structure_label,_,_=market_structure_score(highs,lows,closes)
+    zones=support_resistance_zones(highs,lows,closes,atr)
+    support,resistance=nearest_zones(p,zones)
+    rejection_score,rejection_label=candle_rejection_score(opens,highs,lows,closes,atr)
+    sweep_score,sweep_label=liquidity_sweep_signal(highs,lows,closes,atr)
+    breakout_score,breakout_label=breakout_retest_signal(highs,lows,closes,base_vol,atr)
+    squeeze=compression_score(highs,lows,closes)
+    location_score,location_label=location_quality(p,support,resistance)
+
+    trend_score=50
+    trend_label="mixed"
+    if p>e20>e50:
+        trend_score=76; trend_label="bullish"
+        if e200 and e50>e200:
+            trend_score=85; trend_label="strong bullish"
+    elif p<e20<e50:
+        trend_score=24; trend_label="bearish"
+        if e200 and e50<e200:
+            trend_score=15; trend_label="strong bearish"
+    elif p>e20:
+        trend_score=62; trend_label="mild bullish"
+
+    vwap_score=66 if p>vw else 38
+    rsi_score=72 if 52<=rr<=68 else 25 if rr>=80 else 45 if rr<=28 else 50
+
+    composite=clamp(
+        trend_score*0.22 +
+        structure_score*0.22 +
+        breakout_score*0.14 +
+        sweep_score*0.10 +
+        rejection_score*0.08 +
+        location_score*0.10 +
+        vwap_score*0.08 +
+        rsi_score*0.06
+    )
+
+    profile=volume_profile_zones(highs,lows,closes,quote_vol,24)
+    rsi_vals=rsi_series(closes,14)
+    divergence_score,divergence_label=divergence_signal(closes,rsi_vals)
+
+    return {
+        "price":p,
+        "atr_pct":atr_pct,
+        "rsi":rr,
+        "trend_score":trend_score,
+        "trend_label":trend_label,
+        "structure_score":structure_score,
+        "structure_label":structure_label,
+        "breakout_score":breakout_score,
+        "breakout_label":breakout_label,
+        "sweep_score":sweep_score,
+        "sweep_label":sweep_label,
+        "rejection_score":rejection_score,
+        "rejection_label":rejection_label,
+        "squeeze_score":squeeze,
+        "location_score":location_score,
+        "location_label":location_label,
+        "support":support,
+        "resistance":resistance,
+        "score":composite,
+        "volume_profile":profile,
+        "divergence_score":divergence_score,
+        "divergence_label":divergence_label
+    }
+
+def timeframe_weights_for_horizon(horizon):
+    if horizon=="1h": return {"1m":0.18,"5m":0.28,"10m":0.18,"15m":0.18,"1h":0.12,"4h":0.05,"1d":0.01,"1w":0.00,"1M":0.00,"1y":0.00}
+    if horizon=="4h": return {"1m":0.08,"5m":0.22,"10m":0.16,"15m":0.22,"1h":0.20,"4h":0.09,"1d":0.03,"1w":0.00,"1M":0.00,"1y":0.00}
+    if horizon=="12h": return {"1m":0.04,"5m":0.14,"10m":0.12,"15m":0.18,"1h":0.25,"4h":0.18,"1d":0.07,"1w":0.02,"1M":0.00,"1y":0.00}
+    if horizon=="24h": return {"1m":0.03,"5m":0.10,"10m":0.10,"15m":0.15,"1h":0.25,"4h":0.20,"1d":0.12,"1w":0.04,"1M":0.01,"1y":0.00}
+    if horizon=="3d": return {"1m":0.01,"5m":0.05,"10m":0.06,"15m":0.10,"1h":0.24,"4h":0.24,"1d":0.18,"1w":0.08,"1M":0.03,"1y":0.01}
+    if horizon=="1w": return {"1m":0.00,"5m":0.02,"10m":0.03,"15m":0.06,"1h":0.18,"4h":0.24,"1d":0.25,"1w":0.13,"1M":0.06,"1y":0.03}
+    if horizon=="1m": return {"1m":0.00,"5m":0.01,"10m":0.01,"15m":0.02,"1h":0.08,"4h":0.16,"1d":0.30,"1w":0.23,"1M":0.13,"1y":0.06}
+    if horizon=="3m": return {"1m":0.00,"5m":0.00,"10m":0.00,"15m":0.01,"1h":0.03,"4h":0.09,"1d":0.27,"1w":0.29,"1M":0.19,"1y":0.12}
+    return {"1m":0.00,"5m":0.00,"10m":0.00,"15m":0.00,"1h":0.01,"4h":0.04,"1d":0.17,"1w":0.27,"1M":0.26,"1y":0.25}
+
+
+def model_probability_estimate(score,confidence,risk_score,technical_score,agreement):
+    """
+    Heuristic estimate only. NOT historically calibrated.
+    Kept deliberately bounded to avoid fake certainty.
+    """
+    x=(
+        (score-50)*0.42 +
+        (technical_score-50)*0.20 +
+        (confidence-50)*0.10 +
+        (agreement-50)*0.15 -
+        max(risk_score-50,0)*0.10
+    )
+    prob=50 + x*0.55
+    return round(clamp(prob,18,82),1)
+
+
+
+# ---------------------- PRE-BREAKOUT / DON'T-CHASE ENGINE ----------------------
+
+def early_acceleration_score(frames):
+    """
+    Detects a quiet-to-active transition across 1m/5m/10m/15m/1h charts.
+    The goal is to reward acceleration before a large 24h candle makes the coin obvious.
+    """
+    needed=("1m","5m","10m","15m","1h")
+    if not frames or any(k not in frames for k in needed):
+        return 50.0, ["insufficient intraday data"]
+    f1,f5,f10,f15,f60=(frames[k] for k in needed)
+    score=50.0; reasons=[]
+
+    short_strength = f1.get("score",50)*0.15 + f5.get("score",50)*0.35 + f10.get("score",50)*0.20 + f15.get("score",50)*0.30
+    base = f60.get("score",50)
+    delta = short_strength-base
+    if delta>=12:
+        score+=14; reasons.append("short timeframes accelerating ahead of 1h")
+    elif delta>=6:
+        score+=8; reasons.append("early intraday acceleration")
+    elif delta<=-10:
+        score-=10
+
+    bullish_short=sum(1 for f in (f1,f5,f10,f15) if sf(f.get("trend_score"),50)>=62)
+    if bullish_short>=3 and sf(f60.get("trend_score"),50)>=50:
+        score+=10; reasons.append("broad short-timeframe trend alignment")
+
+    squeeze=max(sf(f15.get("squeeze_score"),50),sf(f60.get("squeeze_score"),50))
+    breakout=max(sf(f5.get("breakout_score"),50),sf(f15.get("breakout_score"),50))
+    if squeeze>=68 and 55<=breakout<=78:
+        score+=12; reasons.append("compression beginning to release")
+    elif squeeze>=72 and breakout<55:
+        score+=7; reasons.append("tight compression before trigger")
+
+    r5=sf(f5.get("rsi"),50); r15=sf(f15.get("rsi"),50)
+    if 50<=r5<=68 and 48<=r15<=66:
+        score+=7; reasons.append("momentum strengthening without RSI exhaustion")
+    if r5>=80 or r15>=78:
+        score-=14; reasons.append("intraday momentum already overextended")
+
+    if sf(f5.get("sweep_score"),50)>=66 or sf(f15.get("sweep_score"),50)>=66:
+        score+=6; reasons.append("recent liquidity sweep supports reversal/expansion")
+
+    return round(clamp(score),1), reasons[:6]
+
+
+def prebreakout_setup_score(tf, change24=0.0, news_score=50.0, catalyst_score=50.0):
+    """
+    Scores whether price looks like it is BEFORE an upside expansion rather than
+    already late in one. This is heuristic research logic, not a calibrated probability.
+    """
+    if not tf or not tf.get("available", True):
+        return 50.0, 50.0, ["Chart data unavailable"]
+
+    score=50.0
+    entry=58.0
+    reasons=[]
+
+    squeeze=sf(tf.get("squeeze_score"),50)
+    breakout=sf(tf.get("breakout_score"),50)
+    sweep=sf(tf.get("sweep_score"),50)
+    location=sf(tf.get("location_score"),50)
+    agreement=sf(tf.get("agreement_score"),50)
+    r=sf(tf.get("rsi"),50)
+    atrp=sf(tf.get("atr_pct"),0)
+    support=tf.get("support")
+    resistance=tf.get("resistance")
+    price=sf(tf.get("price"),0)
+
+    # Compression before expansion.
+    if squeeze>=70:
+        score+=12
+        reasons.append("volatility compression / squeeze")
+    elif squeeze<=40:
+        score-=4
+
+    # Constructive market structure across timeframes.
+    if agreement>=68:
+        score+=10
+        reasons.append("bullish multi-timeframe agreement")
+    elif agreement<=38:
+        score-=10
+
+    # Liquidity sweep below lows can precede reversal/expansion.
+    if sweep>=68:
+        score+=9
+        reasons.append("bullish liquidity sweep")
+    elif sweep<=38:
+        score-=8
+
+    # Location near support or below nearby resistance is preferable to chasing.
+    if location>=64:
+        score+=9
+        entry+=10
+        reasons.append("constructive entry location")
+    elif location<=40:
+        score-=8
+        entry-=15
+
+    # A resistance level not too far overhead can represent a breakout trigger.
+    if price>0 and resistance:
+        dist=(resistance-price)/price*100
+        if 0.35 <= dist <= 4.0:
+            score+=12
+            reasons.append(f"coiling {dist:.1f}% below resistance")
+        elif dist < 0:
+            # Already through resistance: useful only if this is a clean retest, not extension.
+            if breakout>=68:
+                score+=4
+            else:
+                entry-=8
+
+    if price>0 and support:
+        ds=(price-support)/price*100
+        if 0 <= ds <= 3.0:
+            score+=6
+            entry+=7
+            reasons.append("near established support")
+
+    # RSI sweet spot: enough strength without obvious short-term exhaustion.
+    if 48 <= r <= 66:
+        score+=8
+        reasons.append("RSI in pre-breakout strength zone")
+    elif r >= 78:
+        score-=16
+        entry-=24
+        reasons.append("RSI extended")
+    elif r >= 72:
+        score-=8
+        entry-=12
+
+    # News/catalyst should help *before* price fully reacts.
+    if catalyst_score>=65:
+        score+=min(14,(catalyst_score-60)*0.35)
+        reasons.append("positive/upcoming catalyst")
+    if news_score>=62:
+        score+=min(8,(news_score-58)*0.20)
+
+    # Avoid assets that already made the move.
+    c=sf(change24)
+    if c>=30:
+        score-=30; entry-=38; reasons.append("already up 30%+ today — don't chase")
+    elif c>=20:
+        score-=23; entry-=30; reasons.append("already up 20%+ today — extended")
+    elif c>=12:
+        score-=14; entry-=20; reasons.append("already up 12%+ today")
+    elif c>=8:
+        score-=7; entry-=10
+    elif -3 <= c <= 6:
+        score+=5  # quiet/early movement is desirable
+
+    # Very high ATR can mean the move is already disorderly.
+    if atrp>=10:
+        entry-=12
+    elif atrp>=6:
+        entry-=5
+
+    return round(clamp(score,0,100),1), round(clamp(entry,0,100),1), reasons[:8]
+
+def chase_penalty(change24, rsi_value, breakout_score=50, location_score=50):
+    p=0.0
+    c=sf(change24)
+    r=sf(rsi_value,50)
+    if c>=30:p+=28
+    elif c>=20:p+=21
+    elif c>=12:p+=13
+    elif c>=8:p+=6
+    if r>=82:p+=18
+    elif r>=76:p+=10
+    elif r>=70:p+=4
+    if sf(location_score,50)<=35:p+=8
+    # Clean breakout/retest can partially offset extension.
+    if sf(breakout_score,50)>=72:p=max(0,p-5)
+    return round(clamp(p,0,45),1)
+
+
+
+# ---------------------- ADVANCED TRADING-STATE ENGINE ----------------------
+
+def normalize_score(x, center=0, scale=1):
+    return clamp(50 + safe_div(x-center, scale, 0)*10)
+
+def rsi_series(values, period=14):
+    if len(values) < period+1:
+        return [50.0]*len(values)
+    out=[50.0]*len(values)
+    gains=[]; losses=[]
+    for i in range(1,len(values)):
+        d=values[i]-values[i-1]
+        gains.append(max(d,0))
+        losses.append(max(-d,0))
+        if i>=period:
+            ag=mean(gains[i-period:i],0)
+            al=mean(losses[i-period:i],0)
+            if al==0:
+                out[i]=70.0 if ag>0 else 50.0
+            else:
+                rs=ag/al
+                out[i]=100-100/(1+rs)
+    return out
+
+def rolling_return(values, n):
+    if len(values)<=n:
+        return 0.0
+    return pct(values[-1], values[-1-n])
+
+def volume_profile_zones(highs,lows,closes,quote_volumes,bins=24):
+    if not closes:
+        return {"poc":None,"hvn":[],"lvn":[]}
+    lo=min(lows); hi=max(highs)
+    if hi<=lo:
+        return {"poc":closes[-1],"hvn":[closes[-1]],"lvn":[]}
+    step=(hi-lo)/bins
+    vols=[0.0]*bins
+    for h,l,c,qv in zip(highs,lows,closes,quote_volumes):
+        typical=(h+l+c)/3
+        idx=int((typical-lo)/step)
+        idx=max(0,min(bins-1,idx))
+        vols[idx]+=qv
+    centers=[lo+(i+0.5)*step for i in range(bins)]
+    total=sum(vols) or 1
+    poc_idx=max(range(bins),key=lambda i:vols[i])
+    ranked=sorted(range(bins),key=lambda i:vols[i],reverse=True)
+    hvn=[centers[i] for i in ranked[:3]]
+    # Low-volume nodes between populated areas can accelerate price.
+    med=statistics.median(vols) if vols else 0
+    lvn=[centers[i] for i,v in enumerate(vols) if v<med*0.35 and v>0]
+    return {
+        "poc":centers[poc_idx],
+        "hvn":hvn,
+        "lvn":lvn[:6],
+        "profile_concentration":max(vols)/total*100
+    }
+
+def anchored_vwap_from(raw, start_index):
+    if not raw:
+        return None
+    start_index=max(0,min(start_index,len(raw)-1))
+    num=0.0; den=0.0
+    for r in raw[start_index:]:
+        h,l,c=sf(r[2]),sf(r[3]),sf(r[4])
+        qv=sf(r[7])
+        typical=(h+l+c)/3
+        num+=typical*qv; den+=qv
+    return safe_div(num,den,sf(raw[-1][4]))
+
+def anchored_vwap_pack(raw):
+    if len(raw)<30:
+        return {}
+    highs=[sf(r[2]) for r in raw]
+    lows=[sf(r[3]) for r in raw]
+    closes=[sf(r[4]) for r in raw]
+    lookback=min(80,len(raw))
+    recent_high_idx=max(range(len(raw)-lookback,len(raw)),key=lambda i:highs[i])
+    recent_low_idx=min(range(len(raw)-lookback,len(raw)),key=lambda i:lows[i])
+    # breakout anchor: strongest positive candle with above-median volume in last 40
+    vols=[sf(r[7]) for r in raw]
+    medv=statistics.median(vols[-40:]) if len(vols)>=40 else statistics.median(vols)
+    candidates=[]
+    for i in range(max(1,len(raw)-40),len(raw)):
+        o,c=sf(raw[i][1]),sf(raw[i][4])
+        ret=pct(c,o) if o else 0
+        if ret>0 and vols[i]>=medv*1.4:
+            candidates.append((ret*vols[i],i))
+    breakout_idx=max(candidates)[1] if candidates else max(0,len(raw)-20)
+    return {
+        "from_swing_low":anchored_vwap_from(raw,recent_low_idx),
+        "from_swing_high":anchored_vwap_from(raw,recent_high_idx),
+        "from_breakout":anchored_vwap_from(raw,breakout_idx),
+        "breakout_anchor_index":breakout_idx
+    }
+
+def cvd_proxy(raw, lookback=40):
+    """
+    Kline proxy from taker-buy quote volume versus total quote volume.
+    Not true exchange-wide CVD, but useful for aggressive-buying pressure.
+    """
+    if not raw:
+        return {"score":50,"delta":0,"trend":"unavailable"}
+    rows=raw[-lookback:]
+    total=0.0; delta=0.0
+    deltas=[]
+    for r in rows:
+        qv=sf(r[7]); taker_buy_q=sf(r[10])
+        d=(taker_buy_q-(qv-taker_buy_q))
+        total+=qv; delta+=d; deltas.append(d)
+    ratio=safe_div(delta,total,0)
+    score=clamp(50+ratio*160)
+    first=sum(deltas[:len(deltas)//2]); second=sum(deltas[len(deltas)//2:])
+    trend="improving" if second>first else "weakening"
+    return {"score":round(score,1),"delta":round(ratio,4),"trend":trend}
+
+def divergence_signal(closes, rsi_vals):
+    if len(closes)<35 or len(rsi_vals)<35:
+        return 50,"none"
+    # Compare recent local extremes with previous block.
+    prev_high=max(closes[-35:-15]); recent_high=max(closes[-15:])
+    prev_low=min(closes[-35:-15]); recent_low=min(closes[-15:])
+    prev_rsi_high=max(rsi_vals[-35:-15]); recent_rsi_high=max(rsi_vals[-15:])
+    prev_rsi_low=min(rsi_vals[-35:-15]); recent_rsi_low=min(rsi_vals[-15:])
+    if recent_high>prev_high and recent_rsi_high<prev_rsi_high-3:
+        return 30,"bearish RSI divergence"
+    if recent_low<prev_low and recent_rsi_low>prev_rsi_low+3:
+        return 72,"bullish RSI divergence"
+    return 50,"none"
+
+def fakeout_score(tf):
+    score=50; reasons=[]
+    if not tf:
+        return score,reasons
+    if tf.get("breakout_label")=="breakout extended above resistance":
+        score-=12; reasons.append("breakout is extended")
+    if sf(tf.get("rejection_score"),50)<40:
+        score-=12; reasons.append("bearish rejection wick")
+    if sf(tf.get("sweep_score"),50)<40:
+        score-=10; reasons.append("liquidity sweep above highs")
+    if sf(tf.get("location_score"),50)<40:
+        score-=8; reasons.append("poor location")
+    if sf(tf.get("rsi"),50)>=78:
+        score-=12; reasons.append("overbought RSI")
+    if sf(tf.get("breakout_score"),50)>=70 and sf(tf.get("location_score"),50)>=55:
+        score+=12; reasons.append("clean breakout / retest")
+    return round(clamp(score),1),reasons
+
+def classify_market_phase(tf, change24, cvd, divergence_score):
+    squeeze=sf(tf.get("squeeze_score"),50)
+    breakout=sf(tf.get("breakout_score"),50)
+    location=sf(tf.get("location_score"),50)
+    structure=sf(tf.get("structure_score"),50)
+    r=sf(tf.get("rsi"),50)
+    ch=sf(change24)
+    if squeeze>=70 and breakout<60 and -4<=ch<=8:
+        return "PRE-BREAKOUT"
+    if breakout>=70 and location>=50 and ch<18:
+        return "BREAKOUT / RETEST"
+    if breakout>=60 and structure>=65 and cvd.get("score",50)>=55 and ch<25:
+        return "CONTINUATION"
+    if r>=78 or ch>=25 or divergence_score<40:
+        return "EXHAUSTION RISK"
+    if structure<=35 and cvd.get("score",50)<45:
+        return "DISTRIBUTION / WEAKNESS"
+    return "TREND / RANGE"
+
+def post_breakout_continuation_score(tf, cvd, divergence_score, avwap_pack, price, change24):
+    score=50.0; reasons=[]
+    breakout=sf(tf.get("breakout_score"),50)
+    location=sf(tf.get("location_score"),50)
+    structure=sf(tf.get("structure_score"),50)
+    agreement=sf(tf.get("agreement_score"),50)
+    r=sf(tf.get("rsi"),50)
+
+    if breakout>=68:
+        score+=14; reasons.append("breakout/retest quality is strong")
+    if structure>=68:
+        score+=10; reasons.append("higher-timeframe structure supports continuation")
+    if agreement>=66:
+        score+=8; reasons.append("timeframes broadly agree")
+    if cvd.get("score",50)>=60:
+        score+=10; reasons.append("aggressive buyers remain active")
+    elif cvd.get("score",50)<=40:
+        score-=10; reasons.append("buying pressure is fading")
+    if divergence_score<=35:
+        score-=14; reasons.append("bearish divergence")
+    elif divergence_score>=68:
+        score+=7; reasons.append("bullish divergence")
+    if location>=60:
+        score+=7
+    elif location<=38:
+        score-=10
+    # Anchored VWAP holding.
+    bav=avwap_pack.get("from_breakout") if avwap_pack else None
+    if bav and price>0:
+        dist=(price-bav)/price*100
+        if -0.5<=dist<=3.5:
+            score+=10; reasons.append("holding breakout anchored VWAP")
+        elif dist>8:
+            score-=9; reasons.append("too far above breakout VWAP")
+        elif dist<-1:
+            score-=12; reasons.append("lost breakout VWAP")
+    if r>=80:
+        score-=12
+    if change24>=20:
+        score-=14; reasons.append("late-stage daily extension")
+    return round(clamp(score),1),reasons[:8]
+
+def relative_strength_score(asset, reference):
+    """
+    Compare asset return to BTC/ETH/market median across 24h and 7d.
+    """
+    a24=sf(asset.get("change_24h")); a7=sf(asset.get("change_7d"))
+    b24=sf(reference.get("btc24")); b7=sf(reference.get("btc7"))
+    e24=sf(reference.get("eth24")); e7=sf(reference.get("eth7"))
+    m24=sf(reference.get("median24")); m7=sf(reference.get("median7"))
+    edge=(a24-b24)*0.25 + (a24-e24)*0.20 + (a24-m24)*0.20 + (a7-b7)*0.15 + (a7-e7)*0.10 + (a7-m7)*0.10
+    return round(clamp(50+edge*1.8),1)
+
+def historical_analog_estimate(raw, horizon_bars=12):
+    """
+    Lightweight self-analogue backtest:
+    Find historical windows with similar momentum/RSI/volatility/volume conditions,
+    then observe how often price was higher after horizon_bars.
+    This is still not a robust out-of-sample model, but is more grounded than a fixed formula.
+    """
+    if len(raw)<140:
+        return {"samples":0,"up_rate":None,"avg_return":None,"score":50}
+    closes=[sf(r[4]) for r in raw]
+    highs=[sf(r[2]) for r in raw]
+    lows=[sf(r[3]) for r in raw]
+    vols=[sf(r[7]) for r in raw]
+    rsis=rsi_series(closes,14)
+    atrs=true_range_series(highs,lows,closes)
+    target_i=len(raw)-1
+    cur={
+        "mom5":pct(closes[target_i],closes[target_i-5]) if target_i>=5 else 0,
+        "mom20":pct(closes[target_i],closes[target_i-20]) if target_i>=20 else 0,
+        "rsi":rsis[target_i],
+        "atr":safe_div(mean(atrs[target_i-13:target_i+1]),closes[target_i],0)*100,
+        "vr":safe_div(vols[target_i],mean(vols[target_i-20:target_i],1),1)
+    }
+    matches=[]
+    for i in range(40,len(raw)-horizon_bars-1):
+        feat={
+            "mom5":pct(closes[i],closes[i-5]),
+            "mom20":pct(closes[i],closes[i-20]),
+            "rsi":rsis[i],
+            "atr":safe_div(mean(atrs[i-13:i+1]),closes[i],0)*100,
+            "vr":safe_div(vols[i],mean(vols[i-20:i],1),1)
+        }
+        dist=(
+            abs(feat["mom5"]-cur["mom5"])*1.0 +
+            abs(feat["mom20"]-cur["mom20"])*0.55 +
+            abs(feat["rsi"]-cur["rsi"])*0.12 +
+            abs(feat["atr"]-cur["atr"])*0.9 +
+            abs(feat["vr"]-cur["vr"])*3.0
+        )
+        future=pct(closes[i+horizon_bars],closes[i])
+        matches.append((dist,future))
+    matches.sort(key=lambda x:x[0])
+    chosen=matches[:20]
+    if len(chosen)<8:
+        return {"samples":len(chosen),"up_rate":None,"avg_return":None,"score":50}
+    up=sum(1 for _,ret in chosen if ret>0)/len(chosen)*100
+    avg=mean([ret for _,ret in chosen])
+    score=clamp(35+up*0.45+avg*1.4)
+    return {"samples":len(chosen),"up_rate":round(up,1),"avg_return":round(avg,2),"score":round(score,1)}
+
+
+# ---------------------- BINANCE.US TECHNICAL / ORDER BOOK ----------------------
+
+def ema(values, span):
+    if not values:
+        return []
+    alpha = 2 / (span + 1)
+    out = [values[0]]
+    for x in values[1:]:
+        out.append(alpha * x + (1 - alpha) * out[-1])
+    return out
+
+def rsi(values, period=14):
+    if len(values) < period + 2:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        d = values[i] - values[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_gain = mean(gains[-period:])
+    avg_loss = mean(losses[-period:])
+    if avg_loss == 0:
+        return 70.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100 - 100 / (1 + rs)
+
+def get_binance_us_symbols():
+    try:
+        j = req_json(f"{BINANCE_US}/api/v3/exchangeInfo", timeout=12, retries=2)
+        return {
+            x["symbol"] for x in j.get("symbols", [])
+            if x.get("status") == "TRADING"
+        }
+    except Exception:
+        return set()
+
+def technical_for_asset(asset, available_symbols, horizon="4h"):
+    pair=f"{asset['symbol']}USDT"
+    if pair not in available_symbols:
+        return {
+            "available":False,"technical_score":50.0,"spread_bps":None,
+            "book_depth":None,"book_imbalance":None,"rsi":None,
+            "trend":"unavailable","structure":"unavailable","support":None,
+            "resistance":None,"chart_signals":[],"timeframes":{},
+            "agreement_score":50.0,
+            "market_phase":"unavailable","post_breakout_score":50.0,"fakeout_score":50.0,
+            "cvd_score":50.0,"cvd_delta":0.0,"cvd_trend":"unavailable",
+            "divergence_score":50.0,"divergence_label":"none",
+            "anchored_vwap":{},"volume_profile":{},"historical_analog":{"samples":0,"up_rate":None,"avg_return":None,"score":50},
+            "early_acceleration_score":50.0,"early_acceleration_reasons":[]
+        }
+
+    try:
+        frames={}
+        raw1m=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"1m","limit":220},timeout=12,retries=2)
+        raw5m=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"5m","limit":220},timeout=12,retries=2)
+        raw15m=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"15m","limit":220},timeout=12,retries=2)
+        raw1h=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"1h","limit":220},timeout=12,retries=2)
+        raw4h=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"4h","limit":220},timeout=12,retries=2)
+        raw1d=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"1d","limit":365},timeout=12,retries=2)
+        raw1w=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"1w","limit":180},timeout=12,retries=2)
+        raw1M=req_json(f"{BINANCE_US}/api/v3/klines",{"symbol":pair,"interval":"1M","limit":60},timeout=12,retries=2)
+
+        frames["1m"]=analyze_timeframe(raw1m)
+        frames["5m"]=analyze_timeframe(raw5m)
+        frames["10m"]=analyze_timeframe(aggregate_10m(raw5m))
+        frames["15m"]=analyze_timeframe(raw15m)
+        frames["1h"]=analyze_timeframe(raw1h)
+        frames["4h"]=analyze_timeframe(raw4h)
+        frames["1d"]=analyze_timeframe(raw1d)
+        frames["1w"]=analyze_timeframe(raw1w)
+        frames["1M"]=analyze_timeframe(raw1M)
+        # "1y" is a one-year structural read derived from daily candles.
+        frames["1y"]=analyze_timeframe(raw1d[-365:])
+        early_accel, early_accel_reasons = early_acceleration_score(frames)
+
+        # Deeper trading-state inputs.
+        active_raw = raw15m if horizon in ("24h","3d") else raw1h if horizon=="1w" else raw4h if horizon=="1m" else raw1d
+        cvd = cvd_proxy(active_raw,40)
+        avwap = anchored_vwap_pack(active_raw)
+        analog_horizon = 8 if horizon=="24h" else 12 if horizon=="3d" else 24 if horizon=="1w" else 20
+        analog = historical_analog_estimate(active_raw, analog_horizon)
+
+        weights=timeframe_weights_for_horizon(horizon)
+        weighted=sum(frames[k]["score"]*w for k,w in weights.items() if k in frames)
+        total=sum(w for k,w in weights.items() if k in frames) or 1
+        multi=weighted/total
+
+        bullish=sum(1 for f in frames.values() if f["trend_score"]>=62)
+        bearish=sum(1 for f in frames.values() if f["trend_score"]<=35)
+        agreement=clamp(50+(bullish-bearish)*6)
+        if bullish>=7:
+            multi+=7
+        if bearish>=7:
+            multi-=12
+        if bullish>=4 and bearish>=4:
+            multi-=8
+
+        active=frames["15m"] if horizon in ("24h","3d") else frames["1h"] if horizon=="1w" else frames["1d"]
+        structural=frames["1h"] if horizon=="24h" else frames["4h"] if horizon in ("3d","1w") else frames["1d"] if horizon=="1m" else frames["1w"]
+
+        fakeout, fakeout_reasons = fakeout_score(active)
+        post_breakout, post_breakout_reasons = post_breakout_continuation_score(
+            active, cvd, active.get("divergence_score",50), avwap, active["price"], asset.get("change_24h",0)
+        )
+        phase=classify_market_phase(active,asset.get("change_24h",0),cvd,active.get("divergence_score",50))
+
+        book=req_json(f"{BINANCE_US}/api/v3/depth",{"symbol":pair,"limit":100},timeout=10,retries=2)
+        bids=[(sf(x[0]),sf(x[1])) for x in book.get("bids",[])]
+        asks=[(sf(x[0]),sf(x[1])) for x in book.get("asks",[])]
+
+        spread_bps=None; depth=None; imbalance=None; orderbook_score=50
+        if bids and asks:
+            best_bid=bids[0][0]; best_ask=asks[0][0]
+            mid=(best_bid+best_ask)/2
+            spread_bps=safe_div(best_ask-best_bid,mid,0)*10000
+            lo=mid*0.995; hi=mid*1.005
+            bd=sum(px*q for px,q in bids if px>=lo)
+            ad=sum(px*q for px,q in asks if px<=hi)
+            depth=bd+ad
+            imbalance=safe_div(bd-ad,depth,0)
+            if spread_bps<=3:orderbook_score+=10
+            elif spread_bps>15:orderbook_score-=15
+            if depth>=1_000_000:orderbook_score+=8
+            elif depth<100_000:orderbook_score-=10
+            if imbalance>=0.12:orderbook_score+=8
+            elif imbalance<=-0.18:orderbook_score-=8
+
+        # Order book matters most on short horizons.
+        ob_weight=0.14 if horizon=="24h" else 0.10 if horizon=="3d" else 0.06 if horizon=="1w" else 0.02
+        multi=clamp(multi*(1-ob_weight)+clamp(orderbook_score)*ob_weight)
+
+        # Blend continuation/fakeout/CVD/analog lightly; these are higher-order signals.
+        multi=clamp(
+            multi*0.68 +
+            post_breakout*0.12 +
+            fakeout*0.06 +
+            cvd.get("score",50)*0.06 +
+            active.get("divergence_score",50)*0.04 +
+            analog.get("score",50)*0.04
+        )
+
+        signals=[]
+        priority=("1m","5m","10m","15m","1h","4h","1d","1w","1M","1y")
+        for tf in priority:
+            f=frames[tf]
+            if f["sweep_label"]!="none":
+                signals.append(f"{tf}: {f['sweep_label']}")
+            if f["breakout_label"]!="none":
+                signals.append(f"{tf}: {f['breakout_label']}")
+            if f["rejection_label"]!="none":
+                signals.append(f"{tf}: {f['rejection_label']}")
+        signals.append(f"{structural['structure_label']} on structural timeframe")
+        if active.get("divergence_label")!="none": signals.append(active.get("divergence_label"))
+        signals.extend(post_breakout_reasons[:4])
+        signals.extend(fakeout_reasons[:3])
+        if active["location_label"]!="neutral location":
+            signals.append(f"{active['location_label']} on active timeframe")
+
+        support=active["support"]["center"] if active["support"] else None
+        resistance=active["resistance"]["center"] if active["resistance"] else None
+
+        return {
+            "available":True,
+            "price":round(active["price"],8),
+            "technical_score":round(clamp(multi),1),
+            "spread_bps":round(spread_bps,2) if spread_bps is not None else None,
+            "book_depth":round(depth,2) if depth is not None else None,
+            "book_imbalance":round(imbalance,3) if imbalance is not None else None,
+            "rsi":round(active["rsi"],1),
+            "trend":structural["trend_label"],
+            "structure":structural["structure_label"],
+            "support":round(support,8) if support else None,
+            "resistance":round(resistance,8) if resistance else None,
+            "atr_pct":round(active["atr_pct"],2),
+            "location_score":round(active["location_score"],1),
+            "breakout_score":round(active["breakout_score"],1),
+            "sweep_score":round(active["sweep_score"],1),
+            "squeeze_score":round(active["squeeze_score"],1),
+            "agreement_score":round(agreement,1),
+            "chart_signals":signals[:16],
+            "market_phase":phase,
+            "post_breakout_score":post_breakout,
+            "fakeout_score":fakeout,
+            "cvd_score":cvd.get("score",50),
+            "cvd_delta":cvd.get("delta",0),
+            "cvd_trend":cvd.get("trend","unavailable"),
+            "divergence_score":active.get("divergence_score",50),
+            "divergence_label":active.get("divergence_label","none"),
+            "anchored_vwap":avwap,
+            "volume_profile":active.get("volume_profile",{}),
+            "historical_analog":analog,
+            "early_acceleration_score":early_accel,
+            "early_acceleration_reasons":early_accel_reasons,
+            "timeframes":{
+                tf:{
+                    "score":round(frames[tf]["score"],1),
+                    "trend":frames[tf]["trend_label"],
+                    "structure":frames[tf]["structure_label"]
+                } for tf in priority
+            }
+        }
+    except Exception:
+        return {
+            "available":False,"technical_score":50.0,"spread_bps":None,
+            "book_depth":None,"book_imbalance":None,"rsi":None,
+            "trend":"error","structure":"error","support":None,
+            "resistance":None,"chart_signals":[],"timeframes":{},
+            "agreement_score":50.0,
+            "market_phase":"unavailable","post_breakout_score":50.0,"fakeout_score":50.0,
+            "cvd_score":50.0,"cvd_delta":0.0,"cvd_trend":"unavailable",
+            "divergence_score":50.0,"divergence_label":"none",
+            "anchored_vwap":{},"volume_profile":{},"historical_analog":{"samples":0,"up_rate":None,"avg_return":None,"score":50},
+            "early_acceleration_score":50.0,"early_acceleration_reasons":[]
+        }
+
+
+# ---------------------- NEWS / CATALYST ----------------------
+
+def _catalyst_for_asset_uncached(asset,horizon):
+    days={"1h":1,"4h":1,"12h":2,"24h":3,"3d":7,"1w":14,"1m":45,"3m":120,"1y":365}[horizon]
+    google=google_news(f'"{asset["name"]}" {asset["symbol"]}',days,limit=8);industry=relevant_industry_news(asset,6);seen=set();headlines=[]
+    for x in google+industry:
+        k=re.sub(r"\W+"," ",x.get("title","").lower()).strip()
+        if k and k not in seen:seen.add(k);headlines.append(x)
+    reddit=reddit_context(asset,7);pos=neg=future=0;catalyst_titles=[]
+    for h in headlines:
+        sig,f=headline_signal(h["title"])
+        if sig>0:pos+=sig
+        elif sig<0:neg+=abs(sig)
+        future+=f
+        if sig!=0 or f>0:catalyst_titles.append(h["title"])
+    news_score=clamp(50+pos*6-neg*8);catalyst_score=clamp(40+future*7+pos*2-neg*3);recent_run=max(abs(asset["change_24h"]),abs(asset["change_7d"])/2);priced_in=0
+    if catalyst_score>=60:
+        if recent_run>30:priced_in=14
+        elif recent_run>18:priced_in=9
+        elif recent_run>10:priced_in=5
+    return {"news_score":round(news_score,1),"catalyst_score":round(catalyst_score,1),"priced_in_penalty":priced_in,"headlines":headlines[:7],"catalyst_titles":catalyst_titles[:5],"news_mentions":len(headlines),"social_score":reddit["score"],"reddit_mentions":reddit["mentions"],"reddit_sentiment":reddit["sentiment"],"reddit_posts":reddit["posts"]}
+
+
+def catalyst_for_asset(asset, horizon):
+    key=f"{asset.get('id')}:{horizon}"
+    now=time.time()
+    with news_cache_lock:
+        cached=news_cache.get(key)
+        if cached and now-cached["ts"]<NEWS_CACHE_SECONDS:
+            return cached["data"]
+    data=_catalyst_for_asset_uncached(asset,horizon)
+    with news_cache_lock:
+        news_cache[key]={"ts":now,"data":data}
+    return data
+
+# ---------------------- FINAL SCORE ----------------------
+
+def moonshot_profile(asset, risk):
+    mcap = asset["market_cap"]
+    risk_score = asset["risk_score"]
+
+    if risk != "extreme":
+        return None
+
+    if mcap < 25_000_000:
+        label = "Micro-cap moonshot"
+        upside = "A 5–10× move is conceivable in an exceptional catalyst cycle"
+    elif mcap < 100_000_000:
+        label = "Small-cap moonshot"
+        upside = "A 3–8× move is conceivable in a strong catalyst cycle"
+    elif mcap < 500_000_000:
+        label = "High-beta small cap"
+        upside = "A 2–5× move is conceivable in a strong cycle"
+    else:
+        label = "High-volatility large cap"
+        upside = "Large upside is possible, but 10× is structurally harder"
+
+    return {
+        "label":label,
+        "upside":upside,
+        "warning":f"Risk score {risk_score:.0f}/100; severe drawdown or near-total loss is possible"
+    }
+
+def final_score(asset, technical, catalyst, regime, fng_value, horizon, risk):
+    hw = HORIZONS[horizon]
+    cfg = RISK_MODES[risk]
+
+    technical_score = technical["technical_score"]
+    news_score = catalyst["news_score"]
+    catalyst_score = catalyst["catalyst_score"]
+    regime_score = regime["score"]
+
+    # Fear/greed is contextual, not a direct signal.
+    sentiment_context = 50
+    if 35 <= fng_value <= 70:
+        sentiment_context = 58
+    elif fng_value >= 85:
+        sentiment_context = 42
+    elif fng_value <= 15:
+        sentiment_context = 44
+
+    weighted = (
+        asset["momentum_score"] * hw["momentum"] +
+        technical_score * hw["technical"] +
+        asset["liquidity_score"] * hw["liquidity"] +
+        news_score * hw["news"] +
+        catalyst_score * hw["catalyst"] +
+        asset["fundamental_score"] * hw["fundamental"] +
+        regime_score * hw["regime"] +
+        sentiment_context * 0.35
+    )
+
+    denom = (
+        hw["momentum"] + hw["technical"] + hw["liquidity"] +
+        hw["news"] + hw["catalyst"] + hw["fundamental"] +
+        hw["regime"] + 0.35
+    )
+
+    score = weighted / denom
+
+    # Penalize risk differently by mode.
+    score -= asset["risk_score"] * 0.10 * cfg["risk_penalty"]
+
+    # Penalize "already pumped on known news".
+    score -= catalyst["priced_in_penalty"]
+
+    # Extreme mode can reward small-cap asymmetry, but only if liquidity is not terrible.
+    if risk == "extreme" and asset["liquidity_score"] >= 35:
+        if asset["market_cap"] < 25_000_000:
+            score += 8
+        elif asset["market_cap"] < 100_000_000:
+            score += 5
+        elif asset["market_cap"] < 500_000_000:
+            score += 2
+
+    # Conservative mode strongly rejects micro/small caps.
+    if risk == "conservative" and asset["market_cap"] < 5_000_000_000:
+        score -= 8
+
+    # Data quality/confidence is NOT win probability.
+    data_points = 3
+    if technical["available"]:
+        data_points += 3
+    if catalyst["news_mentions"] > 0:
+        data_points += 2
+    if asset["volume"] > 10_000_000:
+        data_points += 1
+    if asset["market_cap"] > 100_000_000:
+        data_points += 1
+
+    confidence = clamp(35 + data_points * 5.5)
+
+    return round(clamp(score),1), round(confidence,1)
+
+def scenario_label(score, risk_score):
+    if score >= 82 and risk_score <= 55:
+        return "Strong setup"
+    if score >= 82:
+        return "Strong but high-risk setup"
+    if score >= 72:
+        return "Watch closely"
+    if score >= 62:
+        return "Speculative watch"
+    return "Low priority"
+
+# ---------------------- OPTIONAL STOCK SUPPORT ----------------------
+
+def finnhub_enabled():
+    return bool(FINNHUB_API_KEY)
+
+# Stock support remains optional in this file. Crypto is the primary engine.
+# The UI clearly labels stocks disabled unless FINNHUB_API_KEY is present.
+# This avoids pretending to scan stocks when no reliable stock feed is configured.
+
+# ---------------------- SCAN PIPELINE ----------------------
+
+def scan_crypto(horizon, risk):
+    rows, provider, warning = get_crypto_universe()
+    if not rows:
+        raise RuntimeError(warning or "No crypto market data returned")
+
+    regime = market_regime(rows)
+    fng_value, fng_label = fear_greed()
+
+    # Broad-market reference for relative strength.
+    btc=next((x for x in rows if str(x.get("symbol","")).lower()=="btc"),{})
+    eth=next((x for x in rows if str(x.get("symbol","")).lower()=="eth"),{})
+    valid24=[sf(x.get("price_change_percentage_24h_in_currency")) for x in rows[:300]]
+    valid7=[sf(x.get("price_change_percentage_7d_in_currency")) for x in rows[:300]]
+    rs_ref={
+        "btc24":sf(btc.get("price_change_percentage_24h_in_currency")),
+        "btc7":sf(btc.get("price_change_percentage_7d_in_currency")),
+        "eth24":sf(eth.get("price_change_percentage_24h_in_currency")),
+        "eth7":sf(eth.get("price_change_percentage_7d_in_currency")),
+        "median24":statistics.median(valid24) if valid24 else 0,
+        "median7":statistics.median(valid7) if valid7 else 0
+    }
+
+    prelim = preprocess_crypto(rows, horizon, risk)
+    if not prelim:
+        return {
+            "updated":int(time.time()),
+            "provider":provider,
+            "warning":warning,
+            "regime":regime,
+            "fear_greed":{"value":fng_value,"label":fng_label},
+            "results":[],
+            "diagnostics":{
+                "raw_universe":len(rows),
+                "prelim_candidates":0,
+                "message":"No coins passed the selected risk/liquidity filters."
+            }
+        }
+
+    prelim = prelim[:PRELIM_LIMIT]
+    available_symbols = get_binance_us_symbols()
+
+    # Deep technical analysis in parallel.
+    technical_map = {}
+    tech_assets = prelim[:TECH_LIMIT]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {
+            ex.submit(technical_for_asset, a, available_symbols, horizon): a["id"]
+            for a in tech_assets
+        }
+        for f in as_completed(futs):
+            technical_map[futs[f]] = f.result()
+
+    # News/catalyst only for strongest candidates. This is the expensive layer.
+    catalyst_map = {}
+    news_assets = prelim[:NEWS_LIMIT]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {
+            ex.submit(catalyst_for_asset, a, horizon): a["id"]
+            for a in news_assets
+        }
+        for f in as_completed(futs):
+            catalyst_map[futs[f]] = f.result()
+
+    coinbase_markets,coinbase_ok=get_coinbase_markets()
+
+    final = []
+    for a in prelim:
+        technical = technical_map.get(a["id"], {
+            "available":False,
+            "technical_score":50.0,
+            "spread_bps":None,
+            "book_depth":None,
+            "book_imbalance":None,
+            "rsi":None,
+            "trend":"not deeply scanned",
+        })
+
+        catalyst = catalyst_map.get(a["id"], {
+            "news_score":50.0,
+            "catalyst_score":40.0,
+            "priced_in_penalty":0,
+            "headlines":[],
+            "catalyst_titles":[],
+            "news_mentions":0,
+            "social_score":50.0,"reddit_mentions":0,"reddit_sentiment":"unavailable","reddit_posts":[],
+        })
+
+        relative_strength = relative_strength_score(a, rs_ref)
+
+        score, confidence = final_score(
+            a, technical, catalyst, regime, fng_value, horizon, risk
+        )
+
+        # Relative strength is important for finding leaders before/through breakouts.
+        rs_weight={"1h":0.12,"4h":0.12,"12h":0.11,"24h":0.10,"3d":0.10,"1w":0.09,"1m":0.07,"3m":0.05,"1y":0.03}.get(horizon,0.07)
+        score=clamp(score*(1-rs_weight)+relative_strength*rs_weight)
+
+        prebreakout_score, entry_quality, prebreakout_reasons = prebreakout_setup_score(
+            technical,
+            a.get("change_24h",0),
+            catalyst.get("news_score",50),
+            catalyst.get("catalyst_score",50)
+        )
+        chase = chase_penalty(
+            a.get("change_24h",0),
+            technical.get("rsi"),
+            technical.get("breakout_score",50),
+            technical.get("location_score",50)
+        )
+        early_accel = sf(technical.get("early_acceleration_score"),50)
+        social_context=sf(catalyst.get("social_score"),50)
+        social_w={"1h":0.03,"4h":0.04,"12h":0.04,"24h":0.04,"3d":0.03}.get(horizon,0.02)
+
+        # For short horizons, explicitly reward setups that appear to be BEFORE the move.
+        # For longer horizons this matters less than quality/fundamentals/catalysts.
+        pre_w = {"1h":0.38,"4h":0.36,"12h":0.33,"24h":0.30,"3d":0.25,"1w":0.18,"1m":0.10,"3m":0.06,"1y":0.03}.get(horizon,0.15)
+        score = clamp(score*(1-pre_w) + prebreakout_score*pre_w - chase)
+        # Microstructure acceleration gets meaningful weight only where minute/hour timing matters.
+        accel_w={"1h":0.24,"4h":0.22,"12h":0.19,"24h":0.16,"3d":0.11,"1w":0.06,"1m":0.02,"3m":0.00,"1y":0.00}.get(horizon,0.05)
+        score=clamp(score*(1-accel_w)+early_accel*accel_w)
+        score=clamp(score*(1-social_w)+social_context*social_w)
+
+        # Post-breakout continuation matters when phase has already transitioned.
+        pb=sf(technical.get("post_breakout_score"),50)
+        analog=sf((technical.get("historical_analog") or {}).get("score"),50)
+        phase=technical.get("market_phase","")
+        if phase in ("BREAKOUT / RETEST","CONTINUATION"):
+            score=clamp(score*0.82 + pb*0.12 + analog*0.06)
+        elif phase=="EXHAUSTION RISK":
+            score=clamp(score-8)
+
+        score = round(score,1)
+
+        probability_estimate = model_probability_estimate(
+            score,
+            confidence,
+            a["risk_score"],
+            technical.get("technical_score",50),
+            technical.get("agreement_score",50)
+        )
+
+        moonshot = moonshot_profile(a, risk)
+
+        row = {
+            **a,
+            "score":score,
+            "confidence":confidence,
+            "model_probability_estimate":probability_estimate,
+            "prebreakout_score":prebreakout_score,
+            "entry_quality":entry_quality,
+            "chase_penalty":chase,
+            "prebreakout_reasons":prebreakout_reasons,
+            "relative_strength_score":relative_strength,
+            "early_acceleration_score":early_accel,
+            "early_acceleration_reasons":technical.get("early_acceleration_reasons",[]),
+            "market_phase":technical.get("market_phase","unavailable"),
+            "post_breakout_score":technical.get("post_breakout_score",50),
+            "fakeout_score":technical.get("fakeout_score",50),
+            "cvd_score":technical.get("cvd_score",50),
+            "cvd_delta":technical.get("cvd_delta",0),
+            "cvd_trend":technical.get("cvd_trend","unavailable"),
+            "divergence_score":technical.get("divergence_score",50),
+            "divergence_label":technical.get("divergence_label","none"),
+            "anchored_vwap":technical.get("anchored_vwap",{}),
+            "volume_profile":technical.get("volume_profile",{}),
+            "historical_analog":technical.get("historical_analog",{}),
+            "scenario":scenario_label(score,a["risk_score"]),
+            "technical_score":technical["technical_score"],
+            "technical_available":technical["available"],
+            "live_pair":f"{a['symbol']}USDT" if technical["available"] else None,
+            "trend":technical["trend"],
+            "rsi":technical["rsi"],
+            "spread_bps":technical["spread_bps"],
+            "book_depth":technical["book_depth"],
+            "book_imbalance":technical["book_imbalance"],
+            "structure":technical.get("structure"),
+            "support":technical.get("support"),
+            "resistance":technical.get("resistance"),
+            "atr_pct":technical.get("atr_pct"),
+            "location_score":technical.get("location_score"),
+            "breakout_score":technical.get("breakout_score"),
+            "sweep_score":technical.get("sweep_score"),
+            "squeeze_score":technical.get("squeeze_score"),
+            "agreement_score":technical.get("agreement_score",50),
+            "chart_signals":technical.get("chart_signals",[]),
+            "timeframes":technical.get("timeframes",{}),
+            "news_score":catalyst["news_score"],
+            "catalyst_score":catalyst["catalyst_score"],
+            "priced_in_penalty":catalyst["priced_in_penalty"],
+            "headlines":catalyst["headlines"],
+            "catalyst_titles":catalyst["catalyst_titles"],
+            "moonshot":moonshot,
+            "coinbase_available":(a["symbol"].upper() in coinbase_markets) if coinbase_ok else None,
+            "coinbase_pairs":coinbase_markets.get(a["symbol"].upper(),[]) if coinbase_ok else [],
+            "social_score":catalyst.get("social_score",50.0),"reddit_mentions":catalyst.get("reddit_mentions",0),"reddit_sentiment":catalyst.get("reddit_sentiment","unavailable"),"reddit_posts":catalyst.get("reddit_posts",[]),
+            "why_now":[
+                f"Momentum {a['momentum_score']:.0f}/100",
+                f"Technical {technical['technical_score']:.0f}/100",
+                f"Liquidity {a['liquidity_score']:.0f}/100",
+                f"Catalyst {catalyst['catalyst_score']:.0f}/100",
+                f"News {catalyst['news_score']:.0f}/100",
+                f"Quality {a['fundamental_score']:.0f}/100",
+                f"Risk {a['risk_score']:.0f}/100",
+            ]
+        }
+        final.append(row)
+
+    final.sort(key=lambda z:(z["score"],z["confidence"]), reverse=True)
+
+    return {
+        "updated":int(time.time()),
+        "provider":provider,
+        "warning":warning,
+        "regime":regime,
+        "fear_greed":{"value":fng_value,"label":fng_label},
+        "results":final[:20],
+        "diagnostics":{
+            "raw_universe":len(rows),
+            "prelim_candidates":len(prelim),
+            "technical_scanned":len(tech_assets),
+            "news_scanned":len(news_assets),
+        }
+    }
+
+def cache_key(asset,horizon,risk):
+    return f"{asset}:{horizon}:{risk}"
+
+def get_scan(asset,horizon,risk,force=False):
+    key = cache_key(asset,horizon,risk)
+
+    with cache_lock:
+        cached = cache.get(key)
+        if cached and not force and time.time() - cached["updated"] < CACHE_SECONDS:
+            return cached
+
+    if asset == "stocks":
+        if not finnhub_enabled():
+            return {
+                "updated":int(time.time()),
+                "error":"Stock scanning is not enabled. Add FINNHUB_API_KEY in Render.",
+                "results":[]
+            }
+        return {
+            "updated":int(time.time()),
+            "error":"Stock engine is intentionally disabled in v3 until a full stock-universe implementation is configured.",
+            "results":[]
+        }
+
+    # "all" currently means crypto plus a clear stock status.
+    # Serialize expensive cold scans so multiple phone refreshes cannot stampede APIs.
+    with scan_compute_lock:
+        with cache_lock:
+            cached = cache.get(key)
+            if cached and not force and time.time() - cached["updated"] < CACHE_SECONDS:
+                return cached
+        data = scan_crypto(horizon,risk)
+    data["asset_type"] = asset
+    data["horizon"] = horizon
+    data["horizon_label"] = HORIZONS[horizon]["label"]
+    data["risk"] = risk
+    data["risk_label"] = RISK_MODES[risk]["label"]
+    data["stocks_enabled"] = finnhub_enabled()
+
+    with cache_lock:
+        cache[key] = data
+
+    return data
+
+# ---------------------- API ----------------------
+
+@app.route("/api/scan")
+def api_scan():
+    asset = request.args.get("asset","crypto")
+    horizon = request.args.get("horizon","4h")
+    risk = request.args.get("risk","aggressive")
+    force = request.args.get("force","0") == "1"
+
+    if asset not in ("crypto","stocks","all"):
+        asset = "crypto"
+    if horizon not in HORIZONS:
+        horizon = "1w"
+    if risk not in RISK_MODES:
+        risk = "aggressive"
+
+    try:
+        data = get_scan(asset,horizon,risk,force)
+        if data.get("error"):
+            return jsonify(data), 200
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({
+            "updated":int(time.time()),
+            "error":str(e),
+            "results":[]
+        }), 500
+
+@app.route("/health")
+def health():
+    return {
+        "ok":True,
+        "version":"10.0-daytrade-focus",
+        "stocks_enabled":finnhub_enabled()
+    }
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name":"Market Opportunity Engine",
+        "short_name":"Market Engine",
+        "start_url":"/",
+        "display":"standalone",
+        "background_color":"#090c11",
+        "theme_color":"#090c11",
+        "icons":[]
+    })
+
+# ---------------------- UI ----------------------
+
+PAGE = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#090c11">
+<link rel="manifest" href="/manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Market Opportunity Engine</title>
+
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{
+ margin:0;background:#090c11;color:#eef2f7;
+ font-family:-apple-system,BlinkMacSystemFont,Inter,Arial,sans-serif
+}
+.wrap{
+ max-width:1100px;margin:auto;
+ padding:calc(env(safe-area-inset-top) + 18px) 14px 50px
+}
+h1{font-size:27px;margin:0 0 4px}
+.sub{font-size:13px;color:#8893a4;line-height:1.4}
+.controls{
+ display:grid;grid-template-columns:repeat(3,1fr);
+ gap:8px;margin:16px 0
+}
+select,button{
+ width:100%;border:1px solid #273042;background:#141923;
+ color:#eef2f7;border-radius:12px;padding:12px;font-size:14px
+}
+button{
+ grid-column:1/-1;background:#eef2f7;color:#101216;
+ font-weight:800;border:none
+}
+.meta{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 14px}
+.pill{
+ background:#141923;border:1px solid #242c3a;
+ border-radius:10px;padding:8px 10px;font-size:11px;color:#a7b0bf
+}
+.card{
+ background:#11161f;border:1px solid #222a39;
+ border-radius:17px;padding:14px;margin:10px 0
+}
+.topcard{border-width:2px}
+.row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.rank{font-size:12px;color:#8691a2}
+.name{font-size:22px;font-weight:850}
+.sym{font-size:13px;color:#9aa5b6}
+.score{font-size:22px;font-weight:850;text-align:right}
+.conf{font-size:11px;color:#8f99aa;text-align:right}
+.price{font-size:18px;font-weight:700;margin:9px 0}
+.grid{
+ display:grid;grid-template-columns:repeat(4,1fr);
+ gap:7px;margin:10px 0
+}
+.metric{
+ background:#181e29;border-radius:10px;padding:8px;
+ font-size:10px;color:#8f99aa
+}
+.metric b{display:block;color:#eef2f7;font-size:13px;margin-top:3px}
+.why{font-size:12px;line-height:1.5;color:#c4cbd5}
+.badge{
+ display:inline-block;background:#1c2330;border-radius:8px;
+ padding:5px 7px;font-size:11px;margin:4px 4px 0 0
+}
+.upside{
+ background:#0d1117;border-radius:10px;padding:9px;
+ font-size:12px;line-height:1.45;margin-top:9px
+}
+.headlines{font-size:11px;color:#97a1b0;line-height:1.45;margin-top:8px}
+.headlines div{margin-top:4px}
+.note{font-size:11px;color:#778294;line-height:1.45;margin-top:16px}
+.warn{
+ background:#261b1c;border:1px solid #493033;
+ padding:10px;border-radius:12px;margin-bottom:12px;font-size:12px
+}
+.empty{text-align:center;padding:35px;color:#8f99aa}
+.diag{font-size:11px;color:#758092;margin:10px 0}
+.live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#9aa4b2;margin-right:5px}
+.live-price{font-variant-numeric:tabular-nums}
+.live-state{font-size:10px;color:#8691a2;margin-left:6px}
+
+@media(max-width:560px){
+ .controls{grid-template-columns:1fr}
+ button{grid-column:auto}
+ .grid{grid-template-columns:repeat(2,1fr)}
+}
+
+.brandv10{display:inline-block;padding:6px 9px;border-radius:999px;background:linear-gradient(135deg,#6f61ff,#9e7cff);font-weight:900;font-size:10px;letter-spacing:.08em;margin-bottom:10px}.updatebar{display:none;position:sticky;top:8px;z-index:9;background:#101824;border:1px solid #3a4a64;border-radius:14px;padding:10px;margin:10px 0;gap:8px;align-items:center}.updatebar.show{display:flex}.updatebar span{flex:1;font-size:11px;color:#b9c6d8}.updatebar button{width:auto;padding:8px 10px}.coinbase-good{color:#7ce3ae!important;border-color:#285b44!important;background:#102219!important}.coinbase-bad{color:#ffadb7!important;border-color:#5c3036!important;background:#281619!important}.focusTitle{font-size:10px;letter-spacing:.12em;color:#8190a8;margin:14px 2px 7px}.focusPanel{border:1px solid #40506c;background:linear-gradient(180deg,#142033,#0e1724);border-radius:18px;padding:14px;margin-bottom:14px}.focusPanel h2{margin:0;font-size:24px}.focusGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px}.focusMetric{background:#0d1520;border:1px solid #1f2b3c;border-radius:10px;padding:8px;font-size:10px;color:#8795aa}.focusMetric b{display:block;font-size:14px;color:#eef4ff;margin-top:3px}.focusWhy{margin-top:10px;padding:10px;border-radius:11px;background:#0b1119;color:#b5c2d3;font-size:11px;line-height:1.5}.focusBtn{margin-top:9px;background:#dcecff!important;color:#08111b!important}.stableHint{padding:10px 11px;border:1px solid #26364a;background:#101723;border-radius:12px;color:#aab7ca;font-size:11px;margin:10px 0}.card{transition:transform .15s ease,border-color .15s ease}.card:focus-within{border-color:#50617e}.controls{position:relative}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+<div class="brandv10">V10 · LIVE DAY-TRADING RADAR</div><h1>Crypto Radar Pro</h1>
+<div class="sub">
+Live prices keep moving while your ranked list stays stable. Focus on a coin without the screen yanking it away.
+</div>
+
+<div class="stableHint"><b>🔒 Stable rankings:</b> prices stay live, but the list only changes when you choose to refresh or apply a new background scan.</div><div class="controls">
+<select id="asset">
+<option value="crypto" selected>Crypto</option>
+<option value="all">Crypto + Stock Status</option>
+<option value="stocks">Stocks</option>
+</select>
+
+<select id="horizon">
+<option value="1h">Next 1 Hour · Scalping</option>
+<option value="4h" selected>Next 4 Hours · Day Trade</option>
+<option value="12h">Next 12 Hours</option>
+<option value="24h">Next 24 Hours</option>
+<option value="3d">Next 3 Days</option>
+<option value="1w">Next Week</option>
+<option value="1m">Next Month</option>
+<option value="3m">Next 3 Months</option>
+<option value="1y">1 Year+</option>
+</select>
+
+<select id="risk">
+<option value="conservative">Conservative</option>
+<option value="moderate">Moderate</option>
+<option value="aggressive" selected>Aggressive</option>
+<option value="extreme">Extreme / Moonshot</option>
+</select>
+
+<button id="scan">REFRESH RANKINGS</button>
+</div>
+
+<div class="meta">
+<div class="pill" id="updated">Updated —</div>
+<div class="pill" id="provider">Provider —</div>
+<div class="pill" id="regime">Regime —</div>
+<div class="pill" id="fng">Fear & Greed —</div>
+</div>
+
+<div id="updatebar" class="updatebar"><span id="updateText">New rankings ready.</span><button id="applyUpdate">APPLY NEW RANKINGS</button></div><div id="focusWrap"><div class="focusTitle">FOCUS MODE · stays on screen</div><div id="focusCard"></div></div><div id="warning"></div>
+<div id="diagnostics"></div>
+<div id="results"><div class="empty">Loading market…</div></div>
+
+<div class="note">
+Scores are research rankings, not guaranteed returns and not calibrated probabilities.
+Confidence measures data completeness, not chance of profit. The model estimate is heuristic and is not a historically calibrated win probability yet. Short-horizon rankings now penalize post-pump chasing and reward pre-breakout compression, constructive structure, support/retests, liquidity sweeps, relative strength, anchored VWAP behavior, volume-profile zones, aggressive-buying pressure, divergence, breakout/retest quality, historical analogs and catalysts that appear before price expansion.
+Extreme / Moonshot mode intentionally accepts much higher failure and drawdown risk.
+A coin described as having conceivable 5–10× upside can also lose nearly all of its value.
+</div>
+</div>
+
+<script>
+const money=x=>{
+ if(x===null || x===undefined)return '—';
+ if(x>=1e12)return '$'+(x/1e12).toFixed(2)+'T';
+ if(x>=1e9)return '$'+(x/1e9).toFixed(2)+'B';
+ if(x>=1e6)return '$'+(x/1e6).toFixed(2)+'M';
+ if(x>=1000)return '$'+x.toLocaleString(undefined,{maximumFractionDigits:2});
+ if(x>=1)return '$'+x.toFixed(4);
+ if(x>=.01)return '$'+x.toFixed(5);
+ return '$'+x.toFixed(8);
+}
+const pct=x=>(x>=0?'+':'')+(x||0).toFixed(2)+'%';
+
+
+let liveSocket=null;
+let liveReconnectTimer=null;
+let liveIndexBySymbol={};
+
+function stopLiveStreams(){
+  if(liveReconnectTimer){clearTimeout(liveReconnectTimer);liveReconnectTimer=null;}
+  if(liveSocket){
+    try{liveSocket.onclose=null;liveSocket.close();}catch(_){}
+    liveSocket=null;
+  }
+  liveIndexBySymbol={};
+}
+
+function startLiveStreams(results){
+  stopLiveStreams();
+  if(!results || !results.length)return;
+
+  const eligible=results
+    .map((c,i)=>({c,i}))
+    .filter(x=>x.c.live_pair)
+    .slice(0,20);
+
+  if(!eligible.length)return;
+
+  liveIndexBySymbol={};
+  const streams=[];
+  eligible.forEach(({c,i})=>{
+    const s=c.live_pair.toLowerCase();
+    liveIndexBySymbol[c.live_pair]={index:i,last:c.price,bid:null,ask:null,c:c};
+    streams.push(s+'@ticker');
+    streams.push(s+'@bookTicker');
+  });
+
+  const url='wss://stream.binance.us:9443/stream?streams='+streams.join('/');
+  try{
+    liveSocket=new WebSocket(url);
+  }catch(e){
+    return;
+  }
+
+  liveSocket.onopen=()=>{
+    eligible.forEach(({i})=>{
+      const el=document.getElementById('live-state-'+i);
+      if(el)el.innerHTML='<span class="live-dot"></span>LIVE';
+    });
+  };
+
+  liveSocket.onmessage=(ev)=>{
+    let msg;
+    try{msg=JSON.parse(ev.data)}catch(_){return}
+    const d=msg.data||msg;
+    const sym=d.s;
+    if(!sym || !liveIndexBySymbol[sym])return;
+    const obj=liveIndexBySymbol[sym];
+    const i=obj.index;
+
+    // ticker stream uses c; bookTicker uses b/a
+    if(d.c!==undefined){
+      const px=Number(d.c);
+      if(Number.isFinite(px) && px>0){
+        obj.last=px;
+        const el=document.getElementById('live-price-'+i);
+        if(el)el.textContent=money(px);
+        if(focusedSymbol===String(obj.c?.symbol||'').toUpperCase()){const f=document.getElementById('focusLivePrice');if(f)f.textContent=money(px)}
+      }
+    }
+    if(d.b!==undefined && d.a!==undefined){
+      const bid=Number(d.b), ask=Number(d.a);
+      if(Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0){
+        obj.bid=bid;obj.ask=ask;
+        const mid=(bid+ask)/2;
+        const spread=(ask-bid)/mid*10000;
+        const el=document.getElementById('live-spread-'+i);
+        if(el)el.textContent='Live spread '+spread.toFixed(2)+' bp';
+      }
+    }
+  };
+
+  liveSocket.onerror=()=>{};
+
+  liveSocket.onclose=()=>{
+    eligible.forEach(({i})=>{
+      const el=document.getElementById('live-state-'+i);
+      if(el)el.textContent='reconnecting…';
+    });
+    liveReconnectTimer=setTimeout(()=>startLiveStreams(results),5000);
+  };
+}
+
+
+let currentData=null,pendingData=null,focusedSymbol=null,focusedSnapshot=null;
+const coinbaseBadge=c=>c.coinbase_available===true?'<span class="badge coinbase-good">Coinbase ✓ Available</span>':c.coinbase_available===false?'<span class="badge coinbase-bad">Coinbase ✕ Not detected</span>':'<span class="badge">Coinbase ? unavailable</span>';
+function focusCoin(c){focusedSymbol=String(c.symbol||'').toUpperCase();focusedSnapshot=JSON.parse(JSON.stringify(c));renderFocus(c);document.getElementById('focusWrap').style.display='block';document.getElementById('focusWrap').scrollIntoView({behavior:'smooth',block:'start'})}
+function closeFocus(){focusedSymbol=null;focusedSnapshot=null;document.getElementById('focusWrap').style.display='none'}
+function renderFocus(c){if(!c)return;const why=(c.prebreakout_reasons||c.why_now||[]).slice(0,6);document.getElementById('focusCard').innerHTML=`<div class="focusPanel"><div class="row"><div><h2>${c.name}</h2><div class="sym">${c.symbol} · ${c.market_phase}</div></div><button style="width:auto" onclick="closeFocus()">Close</button></div><div class="price" id="focusLivePrice">${money(c.price)}</div><div>${coinbaseBadge(c)}<span class="badge">Trend ${c.trend}</span><span class="badge">Reddit ${c.reddit_sentiment||'—'}</span></div><div class="focusGrid"><div class="focusMetric">Radar<b>${c.score}</b></div><div class="focusMetric">Entry<b>${c.entry_quality}</b></div><div class="focusMetric">Pre-breakout<b>${c.prebreakout_score}</b></div><div class="focusMetric">Acceleration<b>${c.early_acceleration_score??'—'}</b></div><div class="focusMetric">Technical<b>${c.technical_score}</b></div><div class="focusMetric">Social<b>${c.social_score??'—'}</b></div></div><div class="focusWhy"><b>What the radar sees</b><br>${why.map(x=>'• '+x).join('<br>')}</div></div>`}
+function focusByIndex(i){const c=currentData?.results?.[i];if(c)focusCoin(c)}
+function applyPending(){if(pendingData){renderResults(pendingData);pendingData=null;document.getElementById('updatebar').classList.remove('show')}}
+
+async function scan(force=false){
+ const asset=document.getElementById('asset').value;
+ const horizon=document.getElementById('horizon').value;
+ const risk=document.getElementById('risk').value;
+ const btn=document.getElementById('scan');
+
+ stopLiveStreams();
+ btn.disabled=true;
+ btn.textContent='SCANNING…';
+ if(!currentData) document.getElementById('results').innerHTML='<div class="empty">Analyzing market…</div>';
+
+ try{
+   const r=await fetch(`/api/scan?asset=${asset}&horizon=${horizon}&risk=${risk}&force=${force?1:0}`);
+   const text=await r.text();
+
+   let d;
+   try{d=JSON.parse(text)}
+   catch(_){throw new Error('Server returned invalid JSON')}
+   currentData=d;
+
+   document.getElementById('updated').textContent='Updated '+new Date(d.updated*1000).toLocaleTimeString();
+
+   if(d.error){
+     document.getElementById('results').innerHTML='<div class="warn">'+d.error+'</div>';
+     document.getElementById('warning').innerHTML='';
+     return;
+   }
+
+   document.getElementById('provider').textContent='Data: '+(d.provider||'—');
+   document.getElementById('regime').textContent='Market: '+(d.regime?.label||'—');
+   document.getElementById('fng').textContent='Fear & Greed: '+(d.fear_greed?.value??'—')+' · '+(d.fear_greed?.label||'—');
+
+   let warnings=[];
+   if(d.warning)warnings.push(d.warning);
+   if((asset==='stocks'||asset==='all') && !d.stocks_enabled){
+     warnings.push('Stocks are not enabled yet. Add FINNHUB_API_KEY in Render when you want the stock engine added.');
+   }
+   document.getElementById('warning').innerHTML=warnings.map(x=>'<div class="warn">'+x+'</div>').join('');
+
+   if(d.diagnostics){
+     document.getElementById('diagnostics').innerHTML=
+       `<div class="diag">Universe ${d.diagnostics.raw_universe||0} · preliminary ${d.diagnostics.prelim_candidates||0} · technical ${d.diagnostics.technical_scanned||0} · news ${d.diagnostics.news_scanned||0}</div>`;
+   }
+
+   if(!d.results || !d.results.length){
+     document.getElementById('results').innerHTML='<div class="empty">No coins passed these filters. Try a different risk mode or horizon.</div>';
+   }else{
+     document.getElementById('results').innerHTML=d.results.map((c,i)=>`
+       <div class="card ${i===0?'topcard':''}">
+         <div class="row">
+           <div>
+             <div class="rank">#${i+1} · ${c.scenario}</div>
+             <div class="name">${c.name}</div>
+             <div class="sym">${c.symbol}</div>
+           </div>
+           <div>
+             <div class="score">${c.score}/100</div>
+             <div class="conf">data confidence ${c.confidence}<br>model estimate ${c.model_probability_estimate}%</div>
+           </div>
+         </div>
+
+         <div class="price">
+           <span class="live-price" id="live-price-${i}">${money(c.price)}</span>
+           · ${pct(c.change_24h)} 24h
+           ${c.live_pair ? `<span class="live-state" id="live-state-${i}"><span class="live-dot"></span>connecting live…</span>`:''}
+         </div>
+
+         <div class="grid">
+           <div class="metric">Momentum<b>${c.momentum_score}</b></div>
+           <div class="metric">Technical<b>${c.technical_score}</b></div>
+           <div class="metric">Liquidity<b>${c.liquidity_score}</b></div>
+           <div class="metric">Catalyst<b>${c.catalyst_score}</b></div>
+           <div class="metric">News<b>${c.news_score}</b></div>
+           <div class="metric">Reddit / Social<b>${c.social_score??'—'}</b></div>
+           <div class="metric">Quality<b>${c.fundamental_score}</b></div>
+           <div class="metric">Risk<b>${c.risk_score}</b></div>
+           <div class="metric">Pre-breakout<b>${c.prebreakout_score}</b></div>
+           <div class="metric">Entry quality<b>${c.entry_quality}</b></div>
+           <div class="metric">Chase penalty<b>${c.chase_penalty}</b></div>
+           <div class="metric">Relative strength<b>${c.relative_strength_score}</b></div>
+           <div class="metric">Post-breakout<b>${c.post_breakout_score}</b></div>
+           <div class="metric">Fakeout quality<b>${c.fakeout_score}</b></div>
+           <div class="metric">Aggressive buying<b>${c.cvd_score}</b></div>
+           <div class="metric">Market cap<b>${money(c.market_cap)}</b></div>
+         </div>
+
+         <div>
+           <span class="badge">Trend: ${c.trend}</span>
+           ${c.rsi!==null ? `<span class="badge">RSI ${c.rsi}</span>`:''}
+           ${c.spread_bps!==null ? `<span class="badge">Spread ${c.spread_bps} bp</span>`:''}
+           ${c.book_imbalance!==null ? `<span class="badge">Book ${c.book_imbalance>=0?'+':''}${c.book_imbalance}</span>`:''}
+           ${c.support ? `<span class="badge">Support ${money(c.support)}</span>`:''}
+           ${c.resistance ? `<span class="badge">Resistance ${money(c.resistance)}</span>`:''}
+           ${c.atr_pct!==undefined && c.atr_pct!==null ? `<span class="badge">ATR ${c.atr_pct}%</span>`:''}
+           ${coinbaseBadge(c)}
+           <span class="badge">Phase: ${c.market_phase}</span>
+           <span class="badge">CVD: ${c.cvd_trend}</span>
+           ${c.live_pair ? `<span class="badge" id="live-spread-${i}">Live spread —</span>`:''}
+           ${c.divergence_label && c.divergence_label!=='none' ? `<span class="badge">${c.divergence_label}</span>`:''}
+         </div>
+
+         ${c.timeframes && Object.keys(c.timeframes).length ? `
+           <div class="upside"><b>Multi-timeframe chart scores:</b><br>
+           ${Object.entries(c.timeframes).map(([tf,v])=>`${tf}: ${v.score}/100 · ${v.trend}`).join('<br>')}
+           </div>
+         `:''}
+
+         ${c.chart_signals && c.chart_signals.length ? `
+           <div class="upside"><b>Price-action signals:</b><br>
+           ${c.chart_signals.map(x=>`• ${x}`).join('<br>')}
+           </div>
+         `:''}
+
+         ${(c.anchored_vwap && Object.keys(c.anchored_vwap).length) || (c.volume_profile && c.volume_profile.poc) ? `
+           <div class="upside"><b>Advanced chart context:</b><br>
+           ${c.anchored_vwap?.from_breakout ? `Breakout AVWAP: ${money(c.anchored_vwap.from_breakout)}<br>`:''}
+           ${c.anchored_vwap?.from_swing_low ? `Swing-low AVWAP: ${money(c.anchored_vwap.from_swing_low)}<br>`:''}
+           ${c.volume_profile?.poc ? `Volume-profile POC: ${money(c.volume_profile.poc)}<br>`:''}
+           ${c.historical_analog?.samples ? `Historical analogs: ${c.historical_analog.samples} matches · ${c.historical_analog.up_rate??'—'}% finished higher · avg ${c.historical_analog.avg_return??'—'}%` : ''}
+           </div>
+         `:''}
+
+         ${c.moonshot ? `
+           <div class="upside"><b>${c.moonshot.label}:</b> ${c.moonshot.upside}<br>
+           <b>Warning:</b> ${c.moonshot.warning}</div>
+         `:''}
+
+         <div class="why"><b>Why now:</b> ${c.why_now.join(' · ')}</div>
+         ${c.prebreakout_reasons && c.prebreakout_reasons.length ? `
+           <div class="upside"><b>Pre-breakout read:</b><br>${c.prebreakout_reasons.map(x=>`• ${x}`).join('<br>')}</div>
+         `:''}
+         ${c.entry_quality < 40 || c.chase_penalty >= 15 ? `
+           <div class="warn"><b>DON'T CHASE:</b> The setup may be extended already. A pullback/retest is preferable to buying purely because price is moving.</div>
+         ` : c.prebreakout_score >= 70 && c.entry_quality >= 55 ? `
+           <div class="upside"><b>EARLY SETUP:</b> This currently has stronger pre-breakout characteristics than post-pump characteristics.</div>
+         `:''}
+
+         <button class="focusBtn" onclick="focusByIndex(${i})">◎ FOCUS ON ${c.symbol}</button>
+
+         ${c.reddit_posts && c.reddit_posts.length ? `<div class="headlines"><b>Recent Reddit context (${c.reddit_sentiment}):</b>${c.reddit_posts.slice(0,4).map(h=>`<div>• ${h.title}</div>`).join('')}</div>`:''}
+         ${c.catalyst_titles && c.catalyst_titles.length ? `
+           <div class="headlines"><b>Potential catalyst headlines:</b>
+           ${c.catalyst_titles.map(h=>`<div>• ${h}</div>`).join('')}
+           </div>
+         `:''}
+       </div>
+     `).join('');
+
+     // Real-time Binance.US price + best bid/ask for ranked coins that trade there.
+     startLiveStreams(d.results);
+     if(focusedSymbol){const newer=d.results.find(x=>String(x.symbol).toUpperCase()===focusedSymbol);renderFocus(newer||focusedSnapshot)}
+   }
+
+ }catch(e){
+   document.getElementById('results').innerHTML='<div class="warn">Scan failed: '+e.message+'</div>';
+ }
+
+ btn.disabled=false;
+ btn.textContent='REFRESH RANKINGS';
+}
+
+document.getElementById('scan').onclick=()=>scan(true);
+document.getElementById('asset').onchange=()=>scan(false);
+document.getElementById('horizon').onchange=()=>scan(false);
+document.getElementById('risk').onchange=()=>scan(false);
+
+scan(false);
+
+// Background radar checks for a fresher ranking but never replaces what you are reading.
+async function backgroundScan(){
+  if(document.hidden||!currentData)return;
+  try{
+    const asset=document.getElementById('asset').value,horizon=document.getElementById('horizon').value,risk=document.getElementById('risk').value;
+    const r=await fetch(`/api/scan?asset=${asset}&horizon=${horizon}&risk=${risk}&force=0`);
+    const fresh=await r.json();
+    if(fresh.error||!fresh.results)return;
+    const oldOrder=(currentData.results||[]).map(x=>x.symbol).join(',');
+    const newOrder=(fresh.results||[]).map(x=>x.symbol).join(',');
+    if(fresh.updated>currentData.updated && newOrder!==oldOrder){pendingData=fresh;document.getElementById('updateText').textContent='New rankings are ready — your current screen is still locked.';document.getElementById('updatebar').classList.add('show')}
+  }catch(_){}
+}
+document.getElementById('applyUpdate').onclick=()=>{if(pendingData){currentData=null;scan(false);pendingData=null;document.getElementById('updatebar').classList.remove('show')}};
+setInterval(backgroundScan,180000);
+
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){
+    stopLiveStreams();
+  }else{
+    if(currentData)startLiveStreams(currentData.results||[]);
+  }
+});
+</script>
+</body>
+</html>"""
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
+
+if __name__ == "__main__":
+    port = env_int("PORT", 10000, 1, 65535)
+    app.run(host="0.0.0.0", port=port)
