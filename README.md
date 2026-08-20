@@ -1,95 +1,95 @@
-# Crypto Radar Pro
+# Market Opportunity Engine
 
-A read-only crypto day-trading research scanner.
+A mobile-friendly market scanner for finding and ranking opportunities across crypto and stocks.
 
-## What it analyzes
+## Features
 
-- 1m, 5m, 15m and 1h price structure
-- EMA 20/50/200
-- RSI
-- MACD momentum
-- rolling VWAP
-- ATR / volatility
-- spot volume and taker-buy share
-- order-book bid/ask spread
-- ±0.5% order-book depth
-- bid/ask imbalance
-- simulated $1,000 market-order slippage
-- perpetual-futures funding
-- open-interest change
-- futures taker buy/sell ratio
-- BTC risk-on / risk-off regime
-- Crypto Fear & Greed
-- recent crypto RSS headlines
-- simple per-coin news sentiment
-- hard liquidity, spread, volatility and overextension filters
-- research entry/invalidation/target levels
-- signal history CSV
-- paper-trading tracker
+### Markets
+- Crypto
+- Stocks
+- Stocks + Crypto
 
-## Safety design
+### Time Horizons
+- Next 24 Hours
+- Next 3 Days
+- Next Week
+- Next Month
+- Next 3 Months
+- 1 Year+
 
-This program **does not have code to place orders**. A score is a heuristic ranking,
-not the probability a trade will win. Run it in paper mode long enough to measure
-its real results after fees/slippage before considering live trading.
+### Risk Modes
+- Conservative
+- Moderate
+- Aggressive
+- Extreme / Moonshot
 
-## Install
+## What the Scanner Analyzes
 
-Python 3.10+ recommended.
+The engine ranks up to 20 opportunities using signals including:
 
-```bash
+- Price momentum
+- Trading volume
+- Market capitalization
+- Liquidity
+- Recent price movement
+- News
+- Upcoming catalysts
+- Product releases
+- Partnerships
+- Network upgrades
+- Regulatory developments
+- Listings
+- Token events
+- Market sentiment
+- Fundamental strength
+- Whether recent news may already be priced into the asset
+
+The importance of each signal changes depending on the selected investment time horizon.
+
+Short-term scans emphasize momentum, news, catalysts, and market activity.
+
+Long-term scans place more emphasis on fundamentals, market quality, adoption, and longer-term catalysts.
+
+## Crypto Coverage
+
+Crypto market discovery uses CoinGecko.
+
+The scanner performs a broad initial market scan and then performs deeper analysis on the strongest candidates.
+
+This allows smaller cryptocurrencies to appear in Aggressive and Extreme / Moonshot mode instead of only ranking the largest cryptocurrencies.
+
+## Stock Coverage
+
+Stock scanning uses Finnhub.
+
+To enable stock scanning, add a Finnhub API key to Render as an environment variable.
+
+Variable name:
+
+FINNHUB_API_KEY
+
+Never put private API keys directly into this GitHub repository.
+
+## Render Deployment
+
+Build command:
+
 pip install -r requirements.txt
-```
 
-## Run one scan
+Start command:
 
-```bash
-python crypto_radar_pro.py --once
-```
+gunicorn app:app --workers 1 --threads 4 --timeout 240
 
-## Run continuously
+## Important
 
-```bash
-python crypto_radar_pro.py
-```
+This application is a research and market-ranking tool.
 
-The default refresh is every 90 seconds. You can change it:
+Scores are model-generated opportunity scores and are not guarantees of future returns.
 
-```bash
-python crypto_radar_pro.py --seconds 120
-```
+The Extreme / Moonshot category searches for unusually high-upside opportunities, including small-cap cryptocurrencies that could potentially experience very large price increases.
 
-A local `dashboard.html` is regenerated every scan. Open that file in a browser.
-It refreshes itself while the Python scanner is running.
+A possible 5x or 10x outcome does NOT mean the model predicts that return will occur.
 
-## Files created while it runs
+Assets capable of extremely large gains can also lose most or all of their value.
 
-- `dashboard.html` — phone/computer-friendly dashboard
-- `data/signal_history.csv` — every ranked scan
-- `data/paper_trades.json` — illustrative paper positions/results
-
-## Important limitations
-
-No scanner can literally take "everything" into account. This one intentionally
-focuses on measurable inputs that can be obtained from public endpoints.
-
-Headline sentiment is deliberately simple. It does not understand sarcasm,
-rumors, fake news, regulatory nuance, token unlocks, wallet flows, SEC filings,
-or every exchange. Derivatives data may be unavailable for some spot symbols.
-
-Public endpoints can change, throttle, or be regionally unavailable. If the
-configured market-data provider blocks your region, the program will tell you.
-
-## Before trusting it
-
-A useful validation standard is not "it found a winner once." Evaluate at least:
-
-- 100+ completed paper trades
-- win rate
-- average win vs. average loss
-- profit factor
-- maximum drawdown
-- results after realistic fees/slippage
-- performance in trending AND sideways markets
-
-If those numbers are poor, modify the strategy; do not connect money.
+Always verify important information and manage position size appropriately.
